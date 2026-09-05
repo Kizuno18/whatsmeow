@@ -307,6 +307,13 @@ func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.Messa
 }
 
 func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
+	// Rewriting the session rows is another read-modify-write of the records
+	// that encrypting and decrypting take these locks for.
+	unlockSessions := cli.Store.LockSessions([]string{
+		pn.SignalAddress().String(),
+		lid.SignalAddress().String(),
+	})
+	defer unlockSessions()
 	err := cli.Store.Sessions.MigratePNToLID(ctx, pn, lid)
 	if err != nil {
 		cli.Log.Errorf("Failed to migrate signal store from %s to %s: %v", pn, lid, err)
@@ -575,6 +582,11 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 	if !ok {
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
+
+	// Without the lock, concurrent sends to the same address could overwrite
+	// this decrypt's ratchet advance (and vice versa).
+	unlockSession := cli.Store.LockSession(from.SignalAddress().String())
+	defer unlockSession()
 
 	builder := session.NewBuilderFromSignal(cli.Store, from.SignalAddress(), pbSerializer)
 	cipher := session.NewCipher(builder, from.SignalAddress())

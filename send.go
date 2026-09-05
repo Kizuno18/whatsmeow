@@ -1093,7 +1093,7 @@ func (cli *Client) preparePeerMessageNode(
 		}
 	}
 	start = time.Now()
-	encrypted, isPreKey, err := cli.encryptMessageForDevice(ctx, plaintext, encryptionIdentity, nil, nil, nil)
+	encrypted, isPreKey, err := cli.encryptMessageForDeviceLocked(ctx, plaintext, encryptionIdentity, nil, nil, nil)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt peer message for %s: %v", to, err)
@@ -1312,6 +1312,11 @@ func (cli *Client) encryptMessageForDevices(
 		sessionAddressToJID[addr] = jid
 	}
 
+	// The decrypt path does its own read-modify-write of the same session
+	// rows; without the lock, either side's ratchet advance can be lost.
+	unlockSessions := cli.Store.LockSessions(sessionAddresses)
+	defer func() { unlockSessions() }()
+	baseCtx := ctx
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
@@ -1322,7 +1327,22 @@ func (cli *Client) encryptMessageForDevices(
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
+	var bundles map[types.JID]*prekey.Bundle
+	if len(retryDevices) > 0 {
+		// Don't hold the session locks across the network round trip. The
+		// sessions may change while unlocked, so re-read them after
+		// re-locking, otherwise PutCachedSessions would overwrite concurrent
+		// ratchet advances.
+		unlockSessions()
+		unlockSessions = func() {}
+		bundles = cli.fetchPreKeysNoError(baseCtx, retryDevices)
+		unlockSessions = cli.Store.LockSessions(sessionAddresses)
+		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
+		}
+		dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
+	}
 
 	for _, jid := range allDevices {
 		plaintext := msgPlaintext
@@ -1356,6 +1376,22 @@ func (cli *Client) encryptMessageForDevices(
 	return participantNodes, includeIdentity, nil
 }
 
+// dropBundlesForExistingSessions removes the prekey bundles fetched for
+// addresses that gained a session while the session locks were released.
+// Processing a bundle creates a fresh session, which would throw away the
+// ratchet state the other side just established.
+func dropBundlesForExistingSessions(
+	bundles map[types.JID]*prekey.Bundle,
+	existingSessions map[string]bool,
+	sessionAddressToJID map[string]types.JID,
+) {
+	for addr, exists := range existingSessions {
+		if exists {
+			delete(bundles, sessionAddressToJID[addr])
+		}
+	}
+}
+
 func (cli *Client) encryptMessageForDeviceAndWrap(
 	ctx context.Context,
 	plaintext []byte,
@@ -1382,6 +1418,21 @@ func copyAttrs(from, to waBinary.Attrs) {
 	for k, v := range from {
 		to[k] = v
 	}
+}
+
+// encryptMessageForDeviceLocked is encryptMessageForDevice for callers that
+// aren't already holding the session lock for the target address.
+func (cli *Client) encryptMessageForDeviceLocked(
+	ctx context.Context,
+	plaintext []byte,
+	to types.JID,
+	bundle *prekey.Bundle,
+	extraAttrs waBinary.Attrs,
+	existingSessions map[string]bool,
+) (*waBinary.Node, bool, error) {
+	unlockSession := cli.Store.LockSession(to.SignalAddress().String())
+	defer unlockSession()
+	return cli.encryptMessageForDevice(ctx, plaintext, to, bundle, extraAttrs, existingSessions)
 }
 
 func (cli *Client) encryptMessageForDevice(
