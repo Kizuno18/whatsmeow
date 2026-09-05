@@ -10,6 +10,7 @@ import (
 	"errors"
 	"testing"
 
+	"go.mau.fi/libsignal/keys/prekey"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -265,5 +266,31 @@ func TestBuildReplyUnsupportedType(t *testing.T) {
 	)
 	if !errors.Is(err, ErrUnsupportedReplyType) {
 		t.Errorf("expected ErrUnsupportedReplyType, got %v", err)
+	}
+}
+
+func TestDropBundlesForExistingSessions(t *testing.T) {
+	gained := types.JID{User: "1", Device: 0, Server: types.DefaultUserServer}
+	missing := types.JID{User: "2", Device: 0, Server: types.DefaultUserServer}
+	sessionAddressToJID := map[string]types.JID{
+		gained.SignalAddress().String():  gained,
+		missing.SignalAddress().String(): missing,
+	}
+	bundles := map[types.JID]*prekey.Bundle{
+		gained:  {},
+		missing: {},
+	}
+	existingSessions := map[string]bool{
+		gained.SignalAddress().String():  true,
+		missing.SignalAddress().String(): false,
+	}
+
+	dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
+
+	if _, ok := bundles[gained]; ok {
+		t.Error("bundle for an address that gained a session while unlocked wasn't dropped")
+	}
+	if _, ok := bundles[missing]; !ok {
+		t.Error("bundle for an address that still has no session was dropped")
 	}
 }
