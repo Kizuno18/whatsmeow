@@ -9,11 +9,10 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/libsignal/state/record"
-
-	"go.mau.fi/util/exsync"
 )
 
 type contextKey int
@@ -28,7 +27,40 @@ type sessionCacheEntry struct {
 	Record *record.Session
 }
 
-type sessionCache = exsync.Map[string, sessionCacheEntry]
+// sessionCache holds the signal sessions of one send for the duration of that
+// send. Only the map is locked, not the entries: a given address is only ever
+// touched by one goroutine at a time, because the send holds that address's
+// session lock and never encrypts for the same address twice in parallel.
+// Locking the whole cache on every session write instead would serialize the
+// encryption of large groups.
+type sessionCache struct {
+	lock    sync.RWMutex
+	entries map[string]*sessionCacheEntry
+}
+
+func (sc *sessionCache) get(address string) *sessionCacheEntry {
+	sc.lock.RLock()
+	defer sc.lock.RUnlock()
+	return sc.entries[address]
+}
+
+func (sc *sessionCache) put(address string, sess *record.Session) {
+	if entry := sc.get(address); entry != nil {
+		entry.Record = sess
+		entry.Found = true
+		entry.Dirty = true
+		return
+	}
+	sc.lock.Lock()
+	defer sc.lock.Unlock()
+	if entry, ok := sc.entries[address]; ok {
+		entry.Record = sess
+		entry.Found = true
+		entry.Dirty = true
+		return
+	}
+	sc.entries[address] = &sessionCacheEntry{Record: sess, Found: true, Dirty: true}
+}
 
 func getSessionCache(ctx context.Context) *sessionCache {
 	if ctx == nil {
@@ -49,11 +81,11 @@ func getCachedSession(ctx context.Context, addr string) *record.Session {
 	if cache == nil {
 		return nil
 	}
-	sess, ok := cache.Get(addr)
-	if !ok {
+	entry := cache.get(addr)
+	if entry == nil {
 		return nil
 	}
-	return sess.Record
+	return entry.Record
 }
 
 func putCachedSession(ctx context.Context, addr string, record *record.Session) bool {
@@ -61,11 +93,7 @@ func putCachedSession(ctx context.Context, addr string, record *record.Session) 
 	if cache == nil {
 		return false
 	}
-	cache.Set(addr, sessionCacheEntry{
-		Dirty:  true,
-		Found:  true,
-		Record: record,
-	})
+	cache.put(addr, record)
 	return true
 }
 
@@ -78,7 +106,7 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 	if err != nil {
 		return nil, ctx, fmt.Errorf("failed to prefetch sessions: %w", err)
 	}
-	wrapped := make(map[string]sessionCacheEntry, len(sessions))
+	wrapped := make(map[string]*sessionCacheEntry, len(sessions))
 	existingSessions := make(map[string]bool, len(sessions))
 	for addr, rawSess := range sessions {
 		var sessionRecord *record.Session
@@ -96,10 +124,10 @@ func (device *Device) WithCachedSessions(ctx context.Context, addresses []string
 			}
 		}
 		existingSessions[addr] = found
-		wrapped[addr] = sessionCacheEntry{Record: sessionRecord, Found: found}
+		wrapped[addr] = &sessionCacheEntry{Record: sessionRecord, Found: found}
 	}
 
-	ctx = context.WithValue(ctx, contextKeySessionCache, (*sessionCache)(exsync.NewMapWithData(wrapped)))
+	ctx = context.WithValue(ctx, contextKeySessionCache, &sessionCache{entries: wrapped})
 	return existingSessions, ctx, nil
 }
 
@@ -108,18 +136,22 @@ func (device *Device) PutCachedSessions(ctx context.Context) error {
 	if cache == nil {
 		return nil
 	}
+	cache.lock.RLock()
 	dirtySessions := make(map[string][]byte)
-	for addr, item := range cache.Iter() {
-		if item.Dirty {
-			dirtySessions[addr] = item.Record.Serialize()
+	for addr, entry := range cache.entries {
+		if entry.Dirty {
+			dirtySessions[addr] = entry.Record.Serialize()
 		}
 	}
+	cache.lock.RUnlock()
 	if len(dirtySessions) > 0 {
 		err := device.Sessions.PutManySessions(ctx, dirtySessions)
 		if err != nil {
 			return fmt.Errorf("failed to store cached sessions: %w", err)
 		}
 	}
-	cache.Clear()
+	cache.lock.Lock()
+	clear(cache.entries)
+	cache.lock.Unlock()
 	return nil
 }

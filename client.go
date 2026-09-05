@@ -191,6 +191,14 @@ type Client struct {
 
 	SendReportingTokens bool
 
+	// EncryptionConcurrency is how many devices a message is encrypted for in parallel when sending.
+	// Sending to a large group means running one pairwise Signal encryption per participant device,
+	// which dominates the send time for groups with hundreds of members.
+	//
+	// Values <= 1 make the encryption loop run sequentially on the calling goroutine.
+	// If unset, DefaultEncryptionConcurrency is used. This should only be set before connecting.
+	EncryptionConcurrency int
+
 	BackgroundEventCtx context.Context
 
 	phoneLinkingCache    atomic.Pointer[phoneLinkingCache]
