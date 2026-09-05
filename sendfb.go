@@ -530,15 +530,21 @@ func (cli *Client) encryptMessageForDevicesV3(
 	dsm *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage,
 	encAttrs waBinary.Attrs,
 ) ([]waBinary.Node, error) {
-	participantNodes := make([]waBinary.Node, 0, len(allDevices))
-
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
-	for _, jid := range allDevices {
+	deviceGroups := make([][]int, 0, len(allDevices))
+	groupByAddress := make(map[string]int, len(allDevices))
+	for i, jid := range allDevices {
 		if jid == ownID {
 			continue
 		}
 		addr := jid.SignalAddress().String()
+		if group, ok := groupByAddress[addr]; ok {
+			deviceGroups[group] = append(deviceGroups[group], i)
+			continue
+		}
+		groupByAddress[addr] = len(deviceGroups)
+		deviceGroups = append(deviceGroups, []int{i})
 		sessionAddresses = append(sessionAddresses, addr)
 		sessionAddressToJID[addr] = jid
 	}
@@ -570,10 +576,9 @@ func (cli *Client) encryptMessageForDevicesV3(
 		dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
 	}
 
-	for _, jid := range allDevices {
-		if jid == ownID {
-			continue
-		}
+	encryptedNodes := make([]*waBinary.Node, len(allDevices))
+	err = cli.forEachDeviceGroup(ctx, deviceGroups, func(ctx context.Context, i int) error {
+		jid := allDevices[i]
 		var dsmForDevice *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage
 		if jid.User == ownID.User {
 			dsmForDevice = dsm
@@ -583,8 +588,19 @@ func (cli *Client) encryptMessageForDevicesV3(
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
-				return nil, err
+				return err
 			}
+			return nil
+		}
+		encryptedNodes[i] = encrypted
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	for _, encrypted := range encryptedNodes {
+		if encrypted == nil {
 			continue
 		}
 		participantNodes = append(participantNodes, *encrypted)

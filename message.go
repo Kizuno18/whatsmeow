@@ -679,14 +679,18 @@ func unpadMessage(plaintext []byte, version int) ([]byte, error) {
 	}
 }
 
+// padMessage returns a new slice with the signal padding appended to the plaintext.
+// It must not write into the input slice: the same plaintext is padded once per
+// recipient device, possibly from several goroutines at a time.
 func padMessage(plaintext []byte) []byte {
 	pad := random.Bytes(1)
 	pad[0] &= 0xf
 	if pad[0] == 0 {
 		pad[0] = 0xf
 	}
-	plaintext = append(plaintext, bytes.Repeat(pad, int(pad[0]))...)
-	return plaintext
+	padded := make([]byte, 0, len(plaintext)+int(pad[0]))
+	padded = append(padded, plaintext...)
+	return append(padded, bytes.Repeat(pad, int(pad[0]))...)
 }
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {

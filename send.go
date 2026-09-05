@@ -27,6 +27,7 @@ import (
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/signalerror"
 	"go.mau.fi/util/random"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
@@ -1540,8 +1541,6 @@ func (cli *Client) encryptMessageForDevices(
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
-	includeIdentity := false
-	participantNodes := make([]waBinary.Node, 0, len(allDevices))
 
 	var pnDevices []types.JID
 	for _, jid := range allDevices {
@@ -1557,7 +1556,9 @@ func (cli *Client) encryptMessageForDevices(
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
-	for _, jid := range allDevices {
+	deviceGroups := make([][]int, 0, len(allDevices))
+	groupByAddress := make(map[string]int, len(allDevices))
+	for i, jid := range allDevices {
 		if jid == ownJID || jid == ownLID {
 			continue
 		}
@@ -1571,6 +1572,12 @@ func (cli *Client) encryptMessageForDevices(
 		}
 		encryptionIdentities[jid] = encryptionIdentity
 		addr := encryptionIdentity.SignalAddress().String()
+		if group, ok := groupByAddress[addr]; ok {
+			deviceGroups[group] = append(deviceGroups[group], i)
+			continue
+		}
+		groupByAddress[addr] = len(deviceGroups)
+		deviceGroups = append(deviceGroups, []int{i})
 		sessionAddresses = append(sessionAddresses, addr)
 		sessionAddressToJID[addr] = jid
 	}
@@ -1607,11 +1614,11 @@ func (cli *Client) encryptMessageForDevices(
 		dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
 	}
 
-	for _, jid := range allDevices {
+	encryptedNodes := make([]*waBinary.Node, len(allDevices))
+	isPreKeyNode := make([]bool, len(allDevices))
+	err = cli.forEachDeviceGroup(ctx, deviceGroups, func(ctx context.Context, i int) error {
+		jid := allDevices[i]
 		plaintext := msgPlaintext
-		if jid == ownJID || jid == ownLID {
-			continue
-		}
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
 			plaintext = dsmPlaintext
 		}
@@ -1622,13 +1629,25 @@ func (cli *Client) encryptMessageForDevices(
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
-				return nil, false, err
+				return err
 			}
+			return nil
+		}
+		encryptedNodes[i] = encrypted
+		isPreKeyNode[i] = isPreKey
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	includeIdentity := false
+	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	for i, encrypted := range encryptedNodes {
+		if encrypted == nil {
 			continue
 		}
-
 		participantNodes = append(participantNodes, *encrypted)
-		if isPreKey {
+		if isPreKeyNode[i] {
 			includeIdentity = true
 		}
 	}
@@ -1637,6 +1656,48 @@ func (cli *Client) encryptMessageForDevices(
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
 	}
 	return participantNodes, includeIdentity, nil
+}
+
+// DefaultEncryptionConcurrency is the number of devices a message is encrypted
+// for in parallel when Client.EncryptionConcurrency isn't set.
+const DefaultEncryptionConcurrency = 8
+
+// forEachDeviceGroup calls fn for every device index in groups.
+//
+// Indices within one group are processed sequentially in the given order, as
+// they share a signal session and each encryption advances the same ratchet.
+// Groups are independent, so they're processed by up to
+// Client.EncryptionConcurrency goroutines in parallel. fn must only write to
+// per-index storage; everything else it touches has to be safe for concurrent
+// use.
+func (cli *Client) forEachDeviceGroup(ctx context.Context, groups [][]int, fn func(context.Context, int) error) error {
+	limit := cli.EncryptionConcurrency
+	if limit == 0 {
+		limit = DefaultEncryptionConcurrency
+	}
+	if limit <= 1 || len(groups) < 2 {
+		for _, group := range groups {
+			for _, i := range group {
+				if err := fn(ctx, i); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	var eg errgroup.Group
+	eg.SetLimit(limit)
+	for _, group := range groups {
+		eg.Go(func() error {
+			for _, i := range group {
+				if err := fn(ctx, i); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	return eg.Wait()
 }
 
 // dropBundlesForExistingSessions removes the prekey bundles fetched for
