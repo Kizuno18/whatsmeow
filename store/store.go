@@ -273,6 +273,12 @@ type Device struct {
 	// Per-address signal session locks, see LockSession.
 	// Zero value is ready to use; never copy a Device after first use.
 	sessionLocks sync.Map
+
+	// saveDeleteLock synchronizes Save and Delete so that a Delete (from a
+	// logged-out connect failure or a device_removed stream error) can't set ID
+	// to nil while a concurrent Save is inside Container.PutDevice, which
+	// dereferences it after the insert.
+	saveDeleteLock sync.Mutex
 }
 
 func (device *Device) GetJID() types.JID {
@@ -296,6 +302,8 @@ func (device *Device) GetLID() types.JID {
 var ErrDeviceDeleted = errors.New("invalid use of deleted device")
 
 func (device *Device) Save(ctx context.Context) error {
+	device.saveDeleteLock.Lock()
+	defer device.saveDeleteLock.Unlock()
 	if device.Deleted {
 		return ErrDeviceDeleted
 	}
@@ -303,6 +311,8 @@ func (device *Device) Save(ctx context.Context) error {
 }
 
 func (device *Device) Delete(ctx context.Context) error {
+	device.saveDeleteLock.Lock()
+	defer device.saveDeleteLock.Unlock()
 	if device.Deleted {
 		return nil
 	}
