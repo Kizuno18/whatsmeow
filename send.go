@@ -152,6 +152,10 @@ type SendRequestExtra struct {
 	Timeout time.Duration
 	// When sending media to newsletters, the Handle field returned by the file upload.
 	MediaHandle string
+	// NoRetry disables the automatic resend after a websocket disconnect interrupts the
+	// initial acknowledgement wait. Retry receipts are controlled separately with
+	// Client.PreRetryCallback.
+	NoRetry bool
 
 	Meta *types.MsgMetaInfo
 	// use this only if you know what you are doing
@@ -438,6 +442,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.DebugTimings.Resp = time.Since(start)
 	if isDisconnectNode(respNode) {
+		if req.NoRetry {
+			err = &DisconnectedError{Action: "message send", Node: respNode}
+			return
+		}
 		start = time.Now()
 		respNode, err = cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)
 		resp.DebugTimings.Retry = time.Since(start)
