@@ -27,7 +27,9 @@ import (
 	"go.mau.fi/libsignal/session"
 	"go.mau.fi/libsignal/signalerror"
 	"go.mau.fi/util/random"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAICommon"
@@ -126,6 +128,15 @@ type SendResponse struct {
 	// The identity the message was sent with (LID or PN)
 	// This is currently not reliable in all cases.
 	Sender types.JID
+
+	// Whether the server responded with a different participant list hash than the one used to
+	// encrypt the message, meaning the local device list cache was stale and some of the
+	// recipient's devices likely did not receive the message. For group and direct chats the
+	// stale cache entry is invalidated automatically, so resending the message (e.g. with the
+	// same ID via SendRequestExtra) will fetch a fresh device list and re-encrypt for the
+	// correct sessions. Broadcast list caches are not invalidated yet, so a resend to a
+	// broadcast list will reuse the same stale participant list.
+	PHashMismatch bool
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -152,10 +163,19 @@ type SendRequestExtra struct {
 	Timeout time.Duration
 	// When sending media to newsletters, the Handle field returned by the file upload.
 	MediaHandle string
+	// NoRetry disables the automatic resend after a websocket disconnect interrupts the
+	// initial acknowledgement wait. Retry receipts are controlled separately with
+	// Client.PreRetryCallback.
+	NoRetry bool
 
 	Meta *types.MsgMetaInfo
 	// use this only if you know what you are doing
 	AdditionalNodes *[]waBinary.Node
+	// The recipients to send to when sending to a broadcast server JID (e.g. a status message).
+	// If this is empty, the recipients of status messages are resolved from the status privacy
+	// settings, and other broadcast lists are not supported. Your own JID is always included in
+	// the recipients even if it's not in this list.
+	Participants []types.JID
 }
 
 // SendMessage sends the given message.
@@ -312,6 +332,11 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 				// Why is this set to PN?
 				extraParams.addressingMode = types.AddressingModePN
 			}
+		} else if len(req.Participants) > 0 {
+			groupParticipants, err = cli.ensureSelfInBroadcastList(req.Participants)
+			if err != nil {
+				return
+			}
 		} else {
 			groupParticipants, err = cli.getBroadcastListParticipants(ctx, to)
 			if err != nil {
@@ -438,6 +463,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.DebugTimings.Resp = time.Since(start)
 	if isDisconnectNode(respNode) {
+		if req.NoRetry {
+			err = &DisconnectedError{Action: "message send", Node: respNode}
+			return
+		}
 		start = time.Now()
 		respNode, err = cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)
 		resp.DebugTimings.Retry = time.Since(start)
@@ -453,6 +482,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
+		resp.PHashMismatch = true
 		cli.Log.Warnf("Server returned different participant list hash (%s != %s) when sending to %s. Some devices may not have received the message.", phash, expectedPHash, to)
 		switch to.Server {
 		case types.GroupServer:
@@ -615,6 +645,219 @@ func (cli *Client) BuildEdit(chat types.JID, id types.MessageID, newContent *waE
 	}
 }
 
+// BuildReply wraps replyContent so that it quotes the message identified by quotedInfo and quotedMsg.
+// The built message can be sent normally using Client.SendMessage.
+//
+// quotedMsg is embedded as a stripped copy (principal content only, no nested quote chain), matching
+// what official WhatsApp clients do. Plain Conversation reply content is promoted to ExtendedTextMessage,
+// and any ContextInfo already set on replyContent (mentions, forwarding flags) is preserved, except for
+// the quote fields themselves, which always point at quotedInfo/quotedMsg.
+//
+// The returned message is a copy: neither quotedMsg nor replyContent is modified.
+//
+// Returns ErrUnsupportedReplyType if replyContent has no field that accepts a ContextInfo.
+//
+//	reply, err := cli.BuildReply(&evt.Info, evt.Message, &waE2E.Message{
+//		Conversation: proto.String("answering"),
+//	})
+func (cli *Client) BuildReply(quotedInfo *types.MessageInfo, quotedMsg, replyContent *waE2E.Message) (*waE2E.Message, error) {
+	if quotedInfo == nil || quotedMsg == nil || replyContent == nil {
+		return nil, errors.New("BuildReply: quotedInfo, quotedMsg and replyContent must all be non-nil")
+	}
+	reply := proto.Clone(replyContent).(*waE2E.Message)
+	if reply.Conversation != nil && reply.ExtendedTextMessage == nil {
+		text := reply.GetConversation()
+		reply.Conversation = nil
+		reply.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: proto.String(text)}
+	}
+	ci := &waE2E.ContextInfo{
+		StanzaID:      proto.String(quotedInfo.ID),
+		Participant:   proto.String(cli.replyParticipant(quotedInfo).String()),
+		QuotedMessage: stripQuotedMessage(quotedMsg),
+	}
+	if err := attachQuotedContext(reply, ci); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
+func (cli *Client) replyParticipant(info *types.MessageInfo) types.JID {
+	if info.IsFromMe {
+		if info.Sender.Server == types.HiddenUserServer {
+			return cli.getOwnLID().ToNonAD()
+		}
+		return cli.getOwnID().ToNonAD()
+	}
+	return info.Sender.ToNonAD()
+}
+
+func stripQuotedMessage(msg *waE2E.Message) *waE2E.Message {
+	switch {
+	case msg.Conversation != nil:
+		return &waE2E.Message{Conversation: proto.String(msg.GetConversation())}
+	case msg.ExtendedTextMessage != nil:
+		et := clearNestedQuote(proto.Clone(msg.ExtendedTextMessage).(*waE2E.ExtendedTextMessage))
+		if extendedTextOnlyHasText(et) {
+			return &waE2E.Message{Conversation: proto.String(et.GetText())}
+		}
+		return &waE2E.Message{ExtendedTextMessage: et}
+	case msg.ImageMessage != nil:
+		return &waE2E.Message{ImageMessage: clearNestedQuote(proto.Clone(msg.ImageMessage).(*waE2E.ImageMessage))}
+	case msg.VideoMessage != nil:
+		return &waE2E.Message{VideoMessage: clearNestedQuote(proto.Clone(msg.VideoMessage).(*waE2E.VideoMessage))}
+	case msg.AudioMessage != nil:
+		return &waE2E.Message{AudioMessage: clearNestedQuote(proto.Clone(msg.AudioMessage).(*waE2E.AudioMessage))}
+	case msg.DocumentMessage != nil:
+		return &waE2E.Message{DocumentMessage: clearNestedQuote(proto.Clone(msg.DocumentMessage).(*waE2E.DocumentMessage))}
+	case msg.StickerMessage != nil:
+		return &waE2E.Message{StickerMessage: clearNestedQuote(proto.Clone(msg.StickerMessage).(*waE2E.StickerMessage))}
+	case msg.LocationMessage != nil:
+		return &waE2E.Message{LocationMessage: clearNestedQuote(proto.Clone(msg.LocationMessage).(*waE2E.LocationMessage))}
+	case msg.LiveLocationMessage != nil:
+		return &waE2E.Message{LiveLocationMessage: clearNestedQuote(proto.Clone(msg.LiveLocationMessage).(*waE2E.LiveLocationMessage))}
+	case msg.ContactMessage != nil:
+		return &waE2E.Message{ContactMessage: clearNestedQuote(proto.Clone(msg.ContactMessage).(*waE2E.ContactMessage))}
+	case msg.ContactsArrayMessage != nil:
+		return &waE2E.Message{ContactsArrayMessage: clearNestedQuote(proto.Clone(msg.ContactsArrayMessage).(*waE2E.ContactsArrayMessage))}
+	case msg.PollCreationMessage != nil:
+		return &waE2E.Message{PollCreationMessage: clearNestedQuote(proto.Clone(msg.PollCreationMessage).(*waE2E.PollCreationMessage))}
+	case msg.ButtonsMessage != nil:
+		return &waE2E.Message{ButtonsMessage: clearNestedQuote(proto.Clone(msg.ButtonsMessage).(*waE2E.ButtonsMessage))}
+	case msg.ListMessage != nil:
+		return &waE2E.Message{ListMessage: clearNestedQuote(proto.Clone(msg.ListMessage).(*waE2E.ListMessage))}
+	case msg.InteractiveMessage != nil:
+		return &waE2E.Message{InteractiveMessage: clearNestedQuote(proto.Clone(msg.InteractiveMessage).(*waE2E.InteractiveMessage))}
+	case msg.GroupInviteMessage != nil:
+		return &waE2E.Message{GroupInviteMessage: clearNestedQuote(proto.Clone(msg.GroupInviteMessage).(*waE2E.GroupInviteMessage))}
+	case msg.ProductMessage != nil:
+		return &waE2E.Message{ProductMessage: clearNestedQuote(proto.Clone(msg.ProductMessage).(*waE2E.ProductMessage))}
+	default:
+		return stripUnknownQuotedMessage(msg)
+	}
+}
+
+// stripUnknownQuotedMessage gives message types that stripQuotedMessage doesn't know about the same
+// treatment as the enumerated ones: the top-level MessageContextInfo (which carries the original
+// message secret) is dropped and the nested quote of whichever submessage holds a ContextInfo is cleared.
+// FutureProofMessage wrappers (view once, ephemeral, document with caption, ...) are unwrapped, so the
+// message they carry is stripped too.
+func stripUnknownQuotedMessage(msg *waE2E.Message) *waE2E.Message {
+	stripped := proto.Clone(msg).(*waE2E.Message)
+	stripQuoteChain(stripped)
+	return stripped
+}
+
+func stripQuoteChain(msg *waE2E.Message) {
+	msg.MessageContextInfo = nil
+	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
+		if fd.Kind() != protoreflect.MessageKind || fd.IsList() || fd.IsMap() {
+			return true
+		}
+		switch sub := val.Message().Interface().(type) {
+		case *waE2E.FutureProofMessage:
+			if sub.Message != nil {
+				stripQuoteChain(sub.Message)
+			}
+		case interface{ GetContextInfo() *waE2E.ContextInfo }:
+			clearNestedQuote(sub)
+		}
+		return true
+	})
+}
+
+func clearNestedQuote[T interface{ GetContextInfo() *waE2E.ContextInfo }](sub T) T {
+	if ci := sub.GetContextInfo(); ci != nil {
+		ci.QuotedMessage = nil
+	}
+	return sub
+}
+
+func extendedTextOnlyHasText(et *waE2E.ExtendedTextMessage) bool {
+	if et == nil || et.Text == nil {
+		return false
+	}
+	cp := proto.Clone(et).(*waE2E.ExtendedTextMessage)
+	cp.Text = nil
+	cp.ContextInfo = nil
+	return proto.Equal(cp, &waE2E.ExtendedTextMessage{})
+}
+
+func attachQuotedContext(msg *waE2E.Message, ci *waE2E.ContextInfo) error {
+	switch {
+	case msg.ViewOnceMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessage.Message, ci)
+	case msg.ViewOnceMessageV2.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessageV2.Message, ci)
+	case msg.ViewOnceMessageV2Extension.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessageV2Extension.Message, ci)
+	case msg.LottieStickerMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.LottieStickerMessage.Message, ci)
+	case msg.EphemeralMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.EphemeralMessage.Message, ci)
+	case msg.DocumentWithCaptionMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.DocumentWithCaptionMessage.Message, ci)
+	case msg.ExtendedTextMessage != nil:
+		msg.ExtendedTextMessage.ContextInfo = mergeQuotedCtx(msg.ExtendedTextMessage.ContextInfo, ci)
+	case msg.ImageMessage != nil:
+		msg.ImageMessage.ContextInfo = mergeQuotedCtx(msg.ImageMessage.ContextInfo, ci)
+	case msg.VideoMessage != nil:
+		msg.VideoMessage.ContextInfo = mergeQuotedCtx(msg.VideoMessage.ContextInfo, ci)
+	case msg.PtvMessage != nil:
+		msg.PtvMessage.ContextInfo = mergeQuotedCtx(msg.PtvMessage.ContextInfo, ci)
+	case msg.AudioMessage != nil:
+		msg.AudioMessage.ContextInfo = mergeQuotedCtx(msg.AudioMessage.ContextInfo, ci)
+	case msg.DocumentMessage != nil:
+		msg.DocumentMessage.ContextInfo = mergeQuotedCtx(msg.DocumentMessage.ContextInfo, ci)
+	case msg.StickerMessage != nil:
+		msg.StickerMessage.ContextInfo = mergeQuotedCtx(msg.StickerMessage.ContextInfo, ci)
+	case msg.LocationMessage != nil:
+		msg.LocationMessage.ContextInfo = mergeQuotedCtx(msg.LocationMessage.ContextInfo, ci)
+	case msg.LiveLocationMessage != nil:
+		msg.LiveLocationMessage.ContextInfo = mergeQuotedCtx(msg.LiveLocationMessage.ContextInfo, ci)
+	case msg.ContactMessage != nil:
+		msg.ContactMessage.ContextInfo = mergeQuotedCtx(msg.ContactMessage.ContextInfo, ci)
+	case msg.ContactsArrayMessage != nil:
+		msg.ContactsArrayMessage.ContextInfo = mergeQuotedCtx(msg.ContactsArrayMessage.ContextInfo, ci)
+	case msg.PollCreationMessage != nil:
+		msg.PollCreationMessage.ContextInfo = mergeQuotedCtx(msg.PollCreationMessage.ContextInfo, ci)
+	case msg.PollCreationMessageV2 != nil:
+		msg.PollCreationMessageV2.ContextInfo = mergeQuotedCtx(msg.PollCreationMessageV2.ContextInfo, ci)
+	case msg.PollCreationMessageV3 != nil:
+		msg.PollCreationMessageV3.ContextInfo = mergeQuotedCtx(msg.PollCreationMessageV3.ContextInfo, ci)
+	case msg.EventMessage != nil:
+		msg.EventMessage.ContextInfo = mergeQuotedCtx(msg.EventMessage.ContextInfo, ci)
+	case msg.ButtonsMessage != nil:
+		msg.ButtonsMessage.ContextInfo = mergeQuotedCtx(msg.ButtonsMessage.ContextInfo, ci)
+	case msg.ListMessage != nil:
+		msg.ListMessage.ContextInfo = mergeQuotedCtx(msg.ListMessage.ContextInfo, ci)
+	case msg.InteractiveMessage != nil:
+		msg.InteractiveMessage.ContextInfo = mergeQuotedCtx(msg.InteractiveMessage.ContextInfo, ci)
+	case msg.GroupInviteMessage != nil:
+		msg.GroupInviteMessage.ContextInfo = mergeQuotedCtx(msg.GroupInviteMessage.ContextInfo, ci)
+	case msg.ProductMessage != nil:
+		msg.ProductMessage.ContextInfo = mergeQuotedCtx(msg.ProductMessage.ContextInfo, ci)
+	default:
+		return ErrUnsupportedReplyType
+	}
+	return nil
+}
+
+// mergeQuotedCtx keeps the unrelated parts of an existing ContextInfo (mentions, forwarding flags,
+// disappearing message settings, ...) but always replaces the quote itself, so building a reply out of
+// content that already quoted something points the new quote at the message actually being replied to.
+func mergeQuotedCtx(existing, incoming *waE2E.ContextInfo) *waE2E.ContextInfo {
+	if existing == nil {
+		return incoming
+	}
+	existing.StanzaID = incoming.StanzaID
+	existing.Participant = incoming.Participant
+	existing.QuotedMessage = incoming.QuotedMessage
+	if incoming.RemoteJID != nil {
+		existing.RemoteJID = incoming.RemoteJID
+	}
+	return existing
+}
+
 const (
 	DisappearingTimerOff     = time.Duration(0)
 	DisappearingTimer24Hours = 24 * time.Hour
@@ -729,10 +972,24 @@ func (cli *Client) sendNewsletter(
 			plaintextNode.Attrs["mediatype"] = mediaType
 		}
 	}
+	content := make([]waBinary.Node, 0, 2)
+	if attrs["type"] == "poll" {
+		pollType := "creation"
+		if message.GetPollUpdateMessage() != nil {
+			pollType = "vote"
+		}
+		content = append(content, waBinary.Node{
+			Tag: "meta",
+			Attrs: waBinary.Attrs{
+				"polltype": pollType,
+			},
+		})
+	}
+	content = append(content, plaintextNode)
 	node := waBinary.Node{
 		Tag:     "message",
 		Attrs:   attrs,
-		Content: []waBinary.Node{plaintextNode},
+		Content: content,
 	}
 	start = time.Now()
 	data, err := cli.sendNodeAndGetData(ctx, node)
@@ -921,8 +1178,10 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return getTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
 	case msg.ReactionMessage != nil, msg.EncReactionMessage != nil:
 		return "reaction"
-	case msg.PollCreationMessage != nil, msg.PollUpdateMessage != nil:
+	case msg.PollCreationMessage != nil, msg.PollCreationMessageV3 != nil, msg.PollUpdateMessage != nil:
 		return "poll"
+	case msg.EventMessage != nil:
+		return "event"
 	case getMediaTypeFromMessage(msg) != "":
 		return "media"
 	case msg.Conversation != nil, msg.ExtendedTextMessage != nil, msg.ProtocolMessage != nil:
@@ -997,12 +1256,8 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 		return getButtonTypeFromMessage(msg.EphemeralMessage.Message)
 	case msg.ButtonsMessage != nil:
 		return "buttons"
-	case msg.ButtonsResponseMessage != nil:
-		return "buttons_response"
 	case msg.ListMessage != nil:
 		return "list"
-	case msg.ListResponseMessage != nil:
-		return "list_response"
 	case msg.InteractiveResponseMessage != nil:
 		return "interactive_response"
 	default:
@@ -1093,7 +1348,7 @@ func (cli *Client) preparePeerMessageNode(
 		}
 	}
 	start = time.Now()
-	encrypted, isPreKey, err := cli.encryptMessageForDevice(ctx, plaintext, encryptionIdentity, nil, nil, nil)
+	encrypted, isPreKey, err := cli.encryptMessageForDeviceLocked(ctx, plaintext, encryptionIdentity, nil, nil, nil)
 	timings.PeerEncrypt = time.Since(start)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt peer message for %s: %v", to, err)
@@ -1134,6 +1389,15 @@ func (cli *Client) getMessageContent(
 			Tag: "meta",
 			Attrs: waBinary.Attrs{
 				"polltype": pollType,
+			},
+		})
+	}
+	if msgAttrs["type"] == "event" {
+		// Edits and cancellations are wrapped in EditedMessage, so only creations reach here.
+		content = append(content, waBinary.Node{
+			Tag: "meta",
+			Attrs: waBinary.Attrs{
+				"event_type": "creation",
 			},
 		})
 	}
@@ -1277,8 +1541,6 @@ func (cli *Client) encryptMessageForDevices(
 ) ([]waBinary.Node, bool, error) {
 	ownJID := cli.getOwnID()
 	ownLID := cli.getOwnLID()
-	includeIdentity := false
-	participantNodes := make([]waBinary.Node, 0, len(allDevices))
 
 	var pnDevices []types.JID
 	for _, jid := range allDevices {
@@ -1294,7 +1556,9 @@ func (cli *Client) encryptMessageForDevices(
 	encryptionIdentities := make(map[types.JID]types.JID, len(allDevices))
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
-	for _, jid := range allDevices {
+	deviceGroups := make([][]int, 0, len(allDevices))
+	groupByAddress := make(map[string]int, len(allDevices))
+	for i, jid := range allDevices {
 		if jid == ownJID || jid == ownLID {
 			continue
 		}
@@ -1308,10 +1572,21 @@ func (cli *Client) encryptMessageForDevices(
 		}
 		encryptionIdentities[jid] = encryptionIdentity
 		addr := encryptionIdentity.SignalAddress().String()
+		if group, ok := groupByAddress[addr]; ok {
+			deviceGroups[group] = append(deviceGroups[group], i)
+			continue
+		}
+		groupByAddress[addr] = len(deviceGroups)
+		deviceGroups = append(deviceGroups, []int{i})
 		sessionAddresses = append(sessionAddresses, addr)
 		sessionAddressToJID[addr] = jid
 	}
 
+	// The decrypt path does its own read-modify-write of the same session
+	// rows; without the lock, either side's ratchet advance can be lost.
+	unlockSessions := cli.Store.LockSessions(sessionAddresses)
+	defer func() { unlockSessions() }()
+	baseCtx := ctx
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
@@ -1322,13 +1597,28 @@ func (cli *Client) encryptMessageForDevices(
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
-
-	for _, jid := range allDevices {
-		plaintext := msgPlaintext
-		if jid == ownJID || jid == ownLID {
-			continue
+	var bundles map[types.JID]*prekey.Bundle
+	if len(retryDevices) > 0 {
+		// Don't hold the session locks across the network round trip. The
+		// sessions may change while unlocked, so re-read them after
+		// re-locking, otherwise PutCachedSessions would overwrite concurrent
+		// ratchet advances.
+		unlockSessions()
+		unlockSessions = func() {}
+		bundles = cli.fetchPreKeysNoError(baseCtx, retryDevices)
+		unlockSessions = cli.Store.LockSessions(sessionAddresses)
+		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to prefetch sessions: %w", err)
 		}
+		dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
+	}
+
+	encryptedNodes := make([]*waBinary.Node, len(allDevices))
+	isPreKeyNode := make([]bool, len(allDevices))
+	err = cli.forEachDeviceGroup(ctx, deviceGroups, func(ctx context.Context, i int) error {
+		jid := allDevices[i]
+		plaintext := msgPlaintext
 		if (jid.User == ownJID.User || jid.User == ownLID.User) && dsmPlaintext != nil {
 			plaintext = dsmPlaintext
 		}
@@ -1339,13 +1629,25 @@ func (cli *Client) encryptMessageForDevices(
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
-				return nil, false, err
+				return err
 			}
+			return nil
+		}
+		encryptedNodes[i] = encrypted
+		isPreKeyNode[i] = isPreKey
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	includeIdentity := false
+	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	for i, encrypted := range encryptedNodes {
+		if encrypted == nil {
 			continue
 		}
-
 		participantNodes = append(participantNodes, *encrypted)
-		if isPreKey {
+		if isPreKeyNode[i] {
 			includeIdentity = true
 		}
 	}
@@ -1354,6 +1656,64 @@ func (cli *Client) encryptMessageForDevices(
 		return nil, false, fmt.Errorf("failed to save cached sessions: %w", err)
 	}
 	return participantNodes, includeIdentity, nil
+}
+
+// DefaultEncryptionConcurrency is the number of devices a message is encrypted
+// for in parallel when Client.EncryptionConcurrency isn't set.
+const DefaultEncryptionConcurrency = 8
+
+// forEachDeviceGroup calls fn for every device index in groups.
+//
+// Indices within one group are processed sequentially in the given order, as
+// they share a signal session and each encryption advances the same ratchet.
+// Groups are independent, so they're processed by up to
+// Client.EncryptionConcurrency goroutines in parallel. fn must only write to
+// per-index storage; everything else it touches has to be safe for concurrent
+// use.
+func (cli *Client) forEachDeviceGroup(ctx context.Context, groups [][]int, fn func(context.Context, int) error) error {
+	limit := cli.EncryptionConcurrency
+	if limit == 0 {
+		limit = DefaultEncryptionConcurrency
+	}
+	if limit <= 1 || len(groups) < 2 {
+		for _, group := range groups {
+			for _, i := range group {
+				if err := fn(ctx, i); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	var eg errgroup.Group
+	eg.SetLimit(limit)
+	for _, group := range groups {
+		eg.Go(func() error {
+			for _, i := range group {
+				if err := fn(ctx, i); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	return eg.Wait()
+}
+
+// dropBundlesForExistingSessions removes the prekey bundles fetched for
+// addresses that gained a session while the session locks were released.
+// Processing a bundle creates a fresh session, which would throw away the
+// ratchet state the other side just established.
+func dropBundlesForExistingSessions(
+	bundles map[types.JID]*prekey.Bundle,
+	existingSessions map[string]bool,
+	sessionAddressToJID map[string]types.JID,
+) {
+	for addr, exists := range existingSessions {
+		if exists {
+			delete(bundles, sessionAddressToJID[addr])
+		}
+	}
 }
 
 func (cli *Client) encryptMessageForDeviceAndWrap(
@@ -1382,6 +1742,21 @@ func copyAttrs(from, to waBinary.Attrs) {
 	for k, v := range from {
 		to[k] = v
 	}
+}
+
+// encryptMessageForDeviceLocked is encryptMessageForDevice for callers that
+// aren't already holding the session lock for the target address.
+func (cli *Client) encryptMessageForDeviceLocked(
+	ctx context.Context,
+	plaintext []byte,
+	to types.JID,
+	bundle *prekey.Bundle,
+	extraAttrs waBinary.Attrs,
+	existingSessions map[string]bool,
+) (*waBinary.Node, bool, error) {
+	unlockSession := cli.Store.LockSession(to.SignalAddress().String())
+	defer unlockSession()
+	return cli.encryptMessageForDevice(ctx, plaintext, to, bundle, extraAttrs, existingSessions)
 }
 
 func (cli *Client) encryptMessageForDevice(

@@ -184,6 +184,10 @@ func (cli *Client) SendFBMessage(
 	}
 	resp.DebugTimings.Resp = time.Since(start)
 	if isDisconnectNode(respNode) {
+		if req.NoRetry {
+			err = &DisconnectedError{Action: "message send", Node: respNode}
+			return
+		}
 		start = time.Now()
 		respNode, err = cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)
 		resp.DebugTimings.Retry = time.Since(start)
@@ -199,6 +203,7 @@ func (cli *Client) SendFBMessage(
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
+		resp.PHashMismatch = true
 		cli.Log.Warnf("Server returned different participant list hash when sending to %s. Some devices may not have received the message.", to)
 		// TODO also invalidate device list caches
 		cli.groupCacheLock.Lock()
@@ -525,18 +530,28 @@ func (cli *Client) encryptMessageForDevicesV3(
 	dsm *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage,
 	encAttrs waBinary.Attrs,
 ) ([]waBinary.Node, error) {
-	participantNodes := make([]waBinary.Node, 0, len(allDevices))
-
 	sessionAddressToJID := make(map[string]types.JID, len(allDevices))
 	sessionAddresses := make([]string, 0, len(allDevices))
-	for _, jid := range allDevices {
+	deviceGroups := make([][]int, 0, len(allDevices))
+	groupByAddress := make(map[string]int, len(allDevices))
+	for i, jid := range allDevices {
 		if jid == ownID {
 			continue
 		}
 		addr := jid.SignalAddress().String()
+		if group, ok := groupByAddress[addr]; ok {
+			deviceGroups[group] = append(deviceGroups[group], i)
+			continue
+		}
+		groupByAddress[addr] = len(deviceGroups)
+		deviceGroups = append(deviceGroups, []int{i})
 		sessionAddresses = append(sessionAddresses, addr)
 		sessionAddressToJID[addr] = jid
 	}
+	// See encryptMessageForDevices for the locking rationale.
+	unlockSessions := cli.Store.LockSessions(sessionAddresses)
+	defer func() { unlockSessions() }()
+	baseCtx := ctx
 	existingSessions, ctx, err := cli.Store.WithCachedSessions(ctx, sessionAddresses)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prefetch sessions: %w", err)
@@ -547,12 +562,23 @@ func (cli *Client) encryptMessageForDevicesV3(
 			retryDevices = append(retryDevices, sessionAddressToJID[addr])
 		}
 	}
-	bundles := cli.fetchPreKeysNoError(ctx, retryDevices)
-
-	for _, jid := range allDevices {
-		if jid == ownID {
-			continue
+	var bundles map[types.JID]*prekey.Bundle
+	if len(retryDevices) > 0 {
+		// See encryptMessageForDevices.
+		unlockSessions()
+		unlockSessions = func() {}
+		bundles = cli.fetchPreKeysNoError(baseCtx, retryDevices)
+		unlockSessions = cli.Store.LockSessions(sessionAddresses)
+		existingSessions, ctx, err = cli.Store.WithCachedSessions(baseCtx, sessionAddresses)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prefetch sessions: %w", err)
 		}
+		dropBundlesForExistingSessions(bundles, existingSessions, sessionAddressToJID)
+	}
+
+	encryptedNodes := make([]*waBinary.Node, len(allDevices))
+	err = cli.forEachDeviceGroup(ctx, deviceGroups, func(ctx context.Context, i int) error {
+		jid := allDevices[i]
 		var dsmForDevice *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage
 		if jid.User == ownID.User {
 			dsmForDevice = dsm
@@ -562,8 +588,19 @@ func (cli *Client) encryptMessageForDevicesV3(
 			// TODO return these errors if it's a fatal one (like context cancellation or database)
 			cli.Log.Warnf("Failed to encrypt %s for %s: %v", id, jid, err)
 			if ctx.Err() != nil {
-				return nil, err
+				return err
 			}
+			return nil
+		}
+		encryptedNodes[i] = encrypted
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	participantNodes := make([]waBinary.Node, 0, len(allDevices))
+	for _, encrypted := range encryptedNodes {
+		if encrypted == nil {
 			continue
 		}
 		participantNodes = append(participantNodes, *encrypted)
@@ -593,6 +630,22 @@ func (cli *Client) encryptMessageForDeviceAndWrapV3(
 		Attrs:   waBinary.Attrs{"jid": to},
 		Content: []waBinary.Node{*node},
 	}, nil
+}
+
+// encryptMessageForDeviceV3Locked is encryptMessageForDeviceV3 for callers
+// that aren't already holding the session lock for the target address.
+func (cli *Client) encryptMessageForDeviceV3Locked(
+	ctx context.Context,
+	payload *waMsgTransport.MessageTransport_Payload,
+	skdm *waMsgTransport.MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage,
+	dsm *waMsgTransport.MessageTransport_Protocol_Integral_DeviceSentMessage,
+	to types.JID,
+	bundle *prekey.Bundle,
+	extraAttrs waBinary.Attrs,
+) (*waBinary.Node, error) {
+	unlockSession := cli.Store.LockSession(to.SignalAddress().String())
+	defer unlockSession()
+	return cli.encryptMessageForDeviceV3(ctx, payload, skdm, dsm, to, bundle, extraAttrs)
 }
 
 func (cli *Client) encryptMessageForDeviceV3(

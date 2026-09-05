@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
@@ -265,10 +266,23 @@ func (cli *Client) GetGroupRequestParticipants(ctx context.Context, jid types.JI
 	}
 	requestParticipants := request.GetChildrenByTag("membership_approval_request")
 	participants := make([]types.GroupParticipantRequest, len(requestParticipants))
+	var lidPairs []store.LIDMapping
 	for i, req := range requestParticipants {
+		cag := req.AttrGetter()
+		participantJID := cag.JID("jid")
 		participants[i] = types.GroupParticipantRequest{
-			JID:         req.AttrGetter().JID("jid"),
-			RequestedAt: req.AttrGetter().UnixTime("request_time"),
+			JID:         participantJID,
+			RequestedAt: cag.UnixTime("request_time"),
+		}
+		if participantJID.Server == types.HiddenUserServer {
+			if pn := cag.OptionalJID("phone_number"); pn != nil && !pn.IsEmpty() {
+				lidPairs = append(lidPairs, store.LIDMapping{LID: participantJID, PN: *pn})
+			}
+		}
+	}
+	if len(lidPairs) > 0 {
+		if err := cli.Store.LIDs.PutManyLIDMappings(ctx, lidPairs); err != nil {
+			cli.Log.Warnf("Failed to store LID mappings from group request participants: %v", err)
 		}
 	}
 	return participants, nil
@@ -818,12 +832,12 @@ func parseGroupLinkTargetNode(groupNode *waBinary.Node) (types.GroupLinkTarget, 
 	}, ag.Error()
 }
 
-func parseParticipantList(node *waBinary.Node) (participants []types.JID, lidPairs []store.LIDMapping) {
+func parseParticipantList(node *waBinary.Node, extraTags ...string) (participants []types.JID, lidPairs []store.LIDMapping) {
 	children := node.GetChildren()
 	participants = make([]types.JID, 0, len(children))
 	for _, child := range children {
 		jid, ok := child.Attrs["jid"].(types.JID)
-		if child.Tag != "participant" || !ok {
+		if !ok || (child.Tag != "participant" && !slices.Contains(extraTags, child.Tag)) {
 			continue
 		}
 		participants = append(participants, jid)
@@ -844,6 +858,22 @@ func parseParticipantList(node *waBinary.Node) (participants []types.JID, lidPai
 				})
 			}
 		}
+	}
+	return
+}
+
+// membershipRequestFallback returns the notification sender as the single membership requester.
+// Membership request notifications about a single user don't always repeat that user in a child
+// node, they only have it in the notification's own participant attribute. The sender is only the
+// requester for self-made requests: with request_method=non_admin_add the sender is the member who
+// added someone else.
+func membershipRequestFallback(sender, senderPN *types.JID, requestMethod string) (participants []types.JID, lidPairs []store.LIDMapping) {
+	if sender == nil || sender.IsEmpty() || (requestMethod != "" && requestMethod != "invite_link") {
+		return
+	}
+	participants = []types.JID{*sender}
+	if sender.Server == types.HiddenUserServer && senderPN != nil && !senderPN.IsEmpty() {
+		lidPairs = []store.LIDMapping{{LID: *sender, PN: *senderPN}}
 	}
 	return
 }
@@ -994,6 +1024,24 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 			evt.Suspended = true
 		case "unsuspended":
 			evt.Unsuspended = true
+		case "created_membership_requests":
+			method := cag.OptionalString("request_method")
+			if method != "" {
+				evt.MembershipRequestMethod = method
+			}
+			requesters, requestPairs := parseParticipantList(&child, "membership_approval_request")
+			if len(requesters) == 0 {
+				requesters, requestPairs = membershipRequestFallback(evt.Sender, evt.SenderPN, method)
+			}
+			evt.MembershipRequestsCreated = append(evt.MembershipRequestsCreated, requesters...)
+			lidPairs = append(lidPairs, requestPairs...)
+		case "deleted_membership_requests", "revoked_membership_requests":
+			requesters, requestPairs := parseParticipantList(&child, "membership_approval_request")
+			if len(requesters) == 0 {
+				requesters, requestPairs = membershipRequestFallback(evt.Sender, evt.SenderPN, cag.OptionalString("request_method"))
+			}
+			evt.MembershipRequestsRevoked = append(evt.MembershipRequestsRevoked, requesters...)
+			lidPairs = append(lidPairs, requestPairs...)
 		default:
 			evt.UnknownChanges = append(evt.UnknownChanges, &child)
 		}
@@ -1086,17 +1134,9 @@ func (cli *Client) SetGroupMemberAddMode(ctx context.Context, jid types.JID, mod
 }
 
 // SetGroupDescription updates the group description.
+//
+// Deprecated: use Client.SetGroupTopic instead, which allows specifying the previous and new
+// description IDs. This method is equivalent to calling it with both IDs left empty.
 func (cli *Client) SetGroupDescription(ctx context.Context, jid types.JID, description string) error {
-	content := waBinary.Node{
-		Tag: "description",
-		Content: []waBinary.Node{
-			{
-				Tag:     "body",
-				Content: []byte(description),
-			},
-		},
-	}
-
-	_, err := cli.sendGroupIQ(ctx, iqSet, jid, content)
-	return err
+	return cli.SetGroupTopic(ctx, jid, "", "", description)
 }

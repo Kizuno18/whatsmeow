@@ -307,6 +307,13 @@ func (cli *Client) handlePlaintextMessage(ctx context.Context, info *types.Messa
 }
 
 func (cli *Client) migrateSessionStore(ctx context.Context, pn, lid types.JID) {
+	// Rewriting the session rows is another read-modify-write of the records
+	// that encrypting and decrypting take these locks for.
+	unlockSessions := cli.Store.LockSessions([]string{
+		pn.SignalAddress().String(),
+		lid.SignalAddress().String(),
+	})
+	defer unlockSessions()
 	err := cli.Store.Sessions.MigratePNToLID(ctx, pn, lid)
 	if err != nil {
 		cli.Log.Errorf("Failed to migrate signal store from %s to %s: %v", pn, lid, err)
@@ -412,16 +419,17 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				return
 			}
 			isUnavailable := encType == "skmsg" && !containsDirectMsg && errors.Is(err, signalerror.ErrNoSenderKeyForUser)
+			retryReason := getRetryReasonFromError(err)
 			if encType == "msmsg" {
 				cli.backgroundIfAsyncAck(func() {
 					cli.sendAck(ctx, node, NackMissingMessageSecret)
 				})
 			} else if cli.SynchronousAck {
-				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
+				cli.sendRetryReceipt(ctx, node, info, isUnavailable, retryReason)
 				// TODO this probably isn't supposed to ack
 				cli.sendAck(ctx, node, 0)
 			} else {
-				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
+				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable, retryReason)
 				go cli.sendAck(ctx, node, 0)
 			}
 			cli.dispatchEvent(&events.UndecryptableMessage{
@@ -576,6 +584,11 @@ func (cli *Client) decryptDM(ctx context.Context, child *waBinary.Node, from typ
 		return nil, nil, fmt.Errorf("message content is not a byte slice")
 	}
 
+	// Without the lock, concurrent sends to the same address could overwrite
+	// this decrypt's ratchet advance (and vice versa).
+	unlockSession := cli.Store.LockSession(from.SignalAddress().String())
+	defer unlockSession()
+
 	builder := session.NewBuilderFromSignal(cli.Store, from.SignalAddress(), pbSerializer)
 	cipher := session.NewCipher(builder, from.SignalAddress())
 	var plaintext []byte
@@ -666,14 +679,18 @@ func unpadMessage(plaintext []byte, version int) ([]byte, error) {
 	}
 }
 
+// padMessage returns a new slice with the signal padding appended to the plaintext.
+// It must not write into the input slice: the same plaintext is padded once per
+// recipient device, possibly from several goroutines at a time.
 func padMessage(plaintext []byte) []byte {
 	pad := random.Bytes(1)
 	pad[0] &= 0xf
 	if pad[0] == 0 {
 		pad[0] = 0xf
 	}
-	plaintext = append(plaintext, bytes.Repeat(pad, int(pad[0]))...)
-	return plaintext
+	padded := make([]byte, 0, len(plaintext)+int(pad[0]))
+	padded = append(padded, plaintext...)
+	return append(padded, bytes.Repeat(pad, int(pad[0]))...)
 }
 
 func (cli *Client) handleSenderKeyDistributionMessage(ctx context.Context, chat, from types.JID, axolotlSKDM []byte) {

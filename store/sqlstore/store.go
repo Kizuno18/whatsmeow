@@ -90,7 +90,7 @@ func (s *SQLStore) DeleteAllIdentities(ctx context.Context, phone string) error 
 }
 
 func (s *SQLStore) DeleteIdentity(ctx context.Context, address string) error {
-	_, err := s.db.Exec(ctx, deleteAllIdentitiesQuery, s.JID, address)
+	_, err := s.db.Exec(ctx, deleteIdentityQuery, s.JID, address)
 	return err
 }
 
@@ -143,6 +143,17 @@ const (
 		WHERE our_jid=$1 AND sender_id LIKE $2 || ':%'
 		ON CONFLICT (our_jid, chat_id, sender_id) DO UPDATE SET sender_key=excluded.sender_key
 	`
+	// Existence check for the rows the PN->LID migration would touch, using the
+	// same LIKE prefix predicates as the migration itself. An explicit >=/< range
+	// over $2||':' and $2||';' would let the primary key index do the work, but it
+	// only matches the same rows under a binary collation: locale collations
+	// (ICU, glibc) ignore ':' at the primary weight, so 'pn:0' sorts after 'pn;'
+	// and the range matches nothing at all.
+	hasPNRowsToMigrateQuery = `
+		SELECT EXISTS(SELECT 1 FROM whatsmeow_sessions WHERE our_jid=$1 AND their_id LIKE $2 || ':%')
+			OR EXISTS(SELECT 1 FROM whatsmeow_identity_keys WHERE our_jid=$1 AND their_id LIKE $2 || ':%')
+			OR EXISTS(SELECT 1 FROM whatsmeow_sender_keys WHERE our_jid=$1 AND sender_id LIKE $2 || ':%')
+	`
 )
 
 func (s *SQLStore) GetSession(ctx context.Context, address string) (session []byte, err error) {
@@ -165,6 +176,14 @@ type addressSessionTuple struct {
 	Address string
 	Session []byte
 }
+
+func (ast addressSessionTuple) GetMassInsertValues() [2]any {
+	return [...]any{ast.Address, ast.Session}
+}
+
+var putSessionsMassInsertBuilder = dbutil.NewMassInsertBuilder[addressSessionTuple, [1]any](
+	putSessionQuery, "($1, $%d, $%d)",
+)
 
 var sessionScanner = dbutil.ConvertRowFn[addressSessionTuple](func(row dbutil.Scannable) (out addressSessionTuple, err error) {
 	err = row.Scan(&out.Address, &out.Session)
@@ -204,10 +223,20 @@ func (s *SQLStore) GetManySessions(ctx context.Context, addresses []string) (map
 	return result, nil
 }
 
+const sessionBatchSize = 400
+
 func (s *SQLStore) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
+	if len(sessions) == 0 {
+		return nil
+	}
+	tuples := make([]addressSessionTuple, 0, len(sessions))
+	for addr, sess := range sessions {
+		tuples = append(tuples, addressSessionTuple{Address: addr, Session: sess})
+	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for addr, sess := range sessions {
-			err := s.PutSession(ctx, addr, sess)
+		for slice := range slices.Chunk(tuples, sessionBatchSize) {
+			query, vars := putSessionsMassInsertBuilder.Build([1]any{s.JID}, slice)
+			_, err := s.db.Exec(ctx, query, vars...)
 			if err != nil {
 				return err
 			}
@@ -250,9 +279,21 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 	if !s.migratedPNSessionsCache.Add(pnSignal) {
 		return nil
 	}
-	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
 	lidSignal := lid.SignalAddressUser()
-	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+	// migratedPNSessionsCache only lives in memory, so after a restart the first
+	// send to each recipient gets here even when the store was migrated long ago.
+	// Opening the transaction unconditionally costs one write transaction per
+	// recipient, which is very noticeable when sending to a lot of them.
+	var hasPNRows bool
+	err := s.db.QueryRow(ctx, hasPNRowsToMigrateQuery, s.JID, pnSignal).Scan(&hasPNRows)
+	if err != nil {
+		s.log.Warnf("Failed to check for rows to migrate from %s: %v", pnSignal, err)
+	} else if !hasPNRows {
+		s.log.Debugf("Nothing to migrate from %s to %s", pnSignal, lidSignal)
+		return nil
+	}
+	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
+	err = s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		res, err := s.db.Exec(ctx, migratePNToLIDSessionsQuery, s.JID, pnSignal, lidSignal)
 		if err != nil {
 			return fmt.Errorf("failed to migrate sessions: %w", err)
@@ -480,9 +521,10 @@ const (
 	getAppStateVersionQuery                 = `SELECT version, hash FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
 	deleteAppStateVersionQuery              = `DELETE FROM whatsmeow_app_state_version WHERE jid=$1 AND name=$2`
 	putAppStateMutationMACsQuery            = `INSERT INTO whatsmeow_app_state_mutation_macs (jid, name, version, index_mac, value_mac) VALUES `
+	putAppStateMutationMACsUpsert           = ` ON CONFLICT (jid, name, index_mac) DO UPDATE SET version=excluded.version, value_mac=excluded.value_mac`
 	deleteAppStateMutationMACsQueryPostgres = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
 	deleteAppStateMutationMACsQueryGeneric  = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
-	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3`
 )
 
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
@@ -531,16 +573,39 @@ func (s *SQLStore) putAppStateMutationMACs(ctx context.Context, name string, ver
 		values[baseIndex+1] = mutation.ValueMAC
 		queryParts[i] = fmt.Sprintf(placeholderSyntax, baseIndex+1, baseIndex+2)
 	}
-	_, err := s.db.Exec(ctx, putAppStateMutationMACsQuery+strings.Join(queryParts, ","), values...)
+	_, err := s.db.Exec(ctx, putAppStateMutationMACsQuery+strings.Join(queryParts, ",")+putAppStateMutationMACsUpsert, values...)
 	return err
 }
 
 const mutationBatchSize = 400
 
+// dedupeMutationMACs keeps only the last MAC for each index. A single patch can set the same
+// index twice, and the upsert in putAppStateMutationMACs can't touch the same row twice in one
+// statement (Postgres rejects it outright).
+func dedupeMutationMACs(mutations []store.AppStateMutationMAC) []store.AppStateMutationMAC {
+	indices := make(map[[32]byte]int, len(mutations))
+	out := make([]store.AppStateMutationMAC, 0, len(mutations))
+	for _, mutation := range mutations {
+		if len(mutation.IndexMAC) != 32 {
+			out = append(out, mutation)
+			continue
+		}
+		key := *(*[32]byte)(mutation.IndexMAC)
+		if i, ok := indices[key]; ok {
+			out[i] = mutation
+			continue
+		}
+		indices[key] = len(out)
+		out = append(out, mutation)
+	}
+	return out
+}
+
 func (s *SQLStore) PutAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []store.AppStateMutationMAC) error {
 	if len(mutations) == 0 {
 		return nil
 	}
+	mutations = dedupeMutationMACs(mutations)
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
 		for slice := range slices.Chunk(mutations, mutationBatchSize) {
 			err := s.putAppStateMutationMACs(ctx, name, version, slice)
@@ -603,6 +668,16 @@ const (
 	`
 	getAllContactsQuery = `
 		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone FROM whatsmeow_contacts WHERE our_jid=$1
+	`
+	getContactsCountQuery = `
+		SELECT COUNT(*) FROM whatsmeow_contacts WHERE our_jid=$1
+	`
+	getContactsPageQuery = `
+		SELECT their_jid, first_name, full_name, push_name, business_name, redacted_phone
+		FROM whatsmeow_contacts
+		WHERE our_jid=$1
+		ORDER BY their_jid
+		LIMIT $2 OFFSET $3
 	`
 )
 
@@ -814,6 +889,44 @@ func (s *SQLStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Cont
 	return output, err
 }
 
+func (s *SQLStore) GetContactsPage(ctx context.Context, limit, offset int) (*store.ContactPage, error) {
+	if limit < 1 {
+		return &store.ContactPage{Items: []store.ContactPageItem{}}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var total int
+	err := s.db.QueryRow(ctx, getContactsCountQuery, s.JID).Scan(&total)
+	if err != nil {
+		return nil, err
+	}
+
+	page := &store.ContactPage{
+		Items: make([]store.ContactPageItem, 0, min(limit, total)),
+		Total: total,
+	}
+	if offset >= total {
+		return page, nil
+	}
+
+	s.contactCacheLock.Lock()
+	defer s.contactCacheLock.Unlock()
+	err = convertContactRow.NewRowIter(s.db.Query(ctx, getContactsPageQuery, s.JID, limit, offset)).Iter(func(tuple *contactTuple) (bool, error) {
+		page.Items = append(page.Items, store.ContactPageItem{
+			JID:  tuple.JID,
+			Info: *tuple.Info,
+		})
+		s.contactCache[tuple.JID] = tuple.Info
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return page, nil
+}
+
 const (
 	putChatSettingQuery = `
 		INSERT INTO whatsmeow_chat_settings (our_jid, chat_jid, %[1]s) VALUES ($1, $2, $3)
@@ -890,13 +1003,20 @@ const (
 	`
 )
 
-func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) (err error) {
+var putMsgSecretsMassInsertBuilder = dbutil.NewMassInsertBuilder[store.MessageSecretInsert, [1]any](
+	putMsgSecret, "($1, $%d, $%d, $%d, $%d)",
+)
+
+const msgSecretBatchSize = 200
+
+func (s *SQLStore) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
 	if len(inserts) == 0 {
 		return nil
 	}
 	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for _, insert := range inserts {
-			_, err = s.db.Exec(ctx, putMsgSecret, s.JID, insert.Chat.ToNonAD(), insert.Sender.ToNonAD(), insert.ID, insert.Secret)
+		for slice := range slices.Chunk(inserts, msgSecretBatchSize) {
+			query, vars := putMsgSecretsMassInsertBuilder.Build([1]any{s.JID}, slice)
+			_, err := s.db.Exec(ctx, query, vars...)
 			if err != nil {
 				return err
 			}

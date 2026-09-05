@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,6 +100,16 @@ func (rpe RedactedPhoneEntry) GetMassInsertValues() [2]any {
 	return [...]any{rpe.JID.String(), rpe.RedactedPhone}
 }
 
+type ContactPageItem struct {
+	JID  types.JID
+	Info types.ContactInfo
+}
+
+type ContactPage struct {
+	Items []ContactPageItem
+	Total int
+}
+
 type ContactStore interface {
 	PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error)
 	PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error)
@@ -107,6 +118,7 @@ type ContactStore interface {
 	PutManyRedactedPhones(ctx context.Context, entries []RedactedPhoneEntry) error
 	GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error)
 	GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
+	GetContactsPage(ctx context.Context, limit, offset int) (*ContactPage, error)
 }
 
 var MutedForever = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
@@ -128,6 +140,10 @@ type MessageSecretInsert struct {
 	Sender types.JID
 	ID     types.MessageID
 	Secret []byte
+}
+
+func (msi MessageSecretInsert) GetMassInsertValues() [4]any {
+	return [...]any{msi.Chat.ToNonAD(), msi.Sender.ToNonAD(), msi.ID, msi.Secret}
 }
 
 type MsgSecretStore interface {
@@ -188,6 +204,7 @@ type LIDStore interface {
 	GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error)
 	GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error)
 	GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error)
+	GetManyPNsForLIDs(ctx context.Context, lids []types.JID) (map[types.JID]types.JID, error)
 }
 
 type AllSessionSpecificStores interface {
@@ -252,6 +269,16 @@ type Device struct {
 	EventBuffer   EventBuffer
 	LIDs          LIDStore
 	Container     DeviceContainer
+
+	// Per-address signal session locks, see LockSession.
+	// Zero value is ready to use; never copy a Device after first use.
+	sessionLocks sync.Map
+
+	// saveDeleteLock synchronizes Save and Delete so that a Delete (from a
+	// logged-out connect failure or a device_removed stream error) can't set ID
+	// to nil while a concurrent Save is inside Container.PutDevice, which
+	// dereferences it after the insert.
+	saveDeleteLock sync.Mutex
 }
 
 func (device *Device) GetJID() types.JID {
@@ -275,6 +302,8 @@ func (device *Device) GetLID() types.JID {
 var ErrDeviceDeleted = errors.New("invalid use of deleted device")
 
 func (device *Device) Save(ctx context.Context) error {
+	device.saveDeleteLock.Lock()
+	defer device.saveDeleteLock.Unlock()
 	if device.Deleted {
 		return ErrDeviceDeleted
 	}
@@ -282,6 +311,8 @@ func (device *Device) Save(ctx context.Context) error {
 }
 
 func (device *Device) Delete(ctx context.Context) error {
+	device.saveDeleteLock.Lock()
+	defer device.saveDeleteLock.Unlock()
 	if device.Deleted {
 		return nil
 	}

@@ -59,6 +59,12 @@ type deviceCache struct {
 	dhash   string
 }
 
+type clientSocket interface {
+	SendFrame(context.Context, []byte) error
+	IsConnected() bool
+	Stop(disconnect, allowOnDisconnect bool)
+}
+
 // Client contains everything necessary to connect to and interact with the WhatsApp web API.
 type Client struct {
 	Store   *store.Device
@@ -66,7 +72,7 @@ type Client struct {
 	recvLog waLog.Logger
 	sendLog waLog.Logger
 
-	socket           *socket.NoiseSocket
+	socket           clientSocket
 	socketLock       sync.RWMutex
 	socketWait       chan struct{}
 	handlerQueueWait chan struct{}
@@ -184,6 +190,14 @@ type Client struct {
 	ErrorOnSubscribePresenceWithoutToken bool
 
 	SendReportingTokens bool
+
+	// EncryptionConcurrency is how many devices a message is encrypted for in parallel when sending.
+	// Sending to a large group means running one pairwise Signal encryption per participant device,
+	// which dominates the send time for groups with hundreds of members.
+	//
+	// Values <= 1 make the encryption loop run sequentially on the calling goroutine.
+	// If unset, DefaultEncryptionConcurrency is used. This should only be set before connecting.
+	EncryptionConcurrency int
 
 	BackgroundEventCtx context.Context
 

@@ -193,6 +193,10 @@ func (n *NoopStore) GetAllContacts(ctx context.Context) (map[types.JID]types.Con
 	return nil, n.Error
 }
 
+func (n *NoopStore) GetContactsPage(ctx context.Context, limit, offset int) (*ContactPage, error) {
+	return nil, n.Error
+}
+
 func (n *NoopStore) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {
 	return n.Error
 }
@@ -278,6 +282,10 @@ func (n *NoopStore) GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, e
 }
 
 func (n *NoopStore) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) GetManyPNsForLIDs(ctx context.Context, lids []types.JID) (map[types.JID]types.JID, error) {
 	return nil, n.Error
 }
 

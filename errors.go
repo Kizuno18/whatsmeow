@@ -111,6 +111,8 @@ var (
 	ErrRecipientADJID           = errors.New("message recipient must be a user JID with no device part")
 	ErrServerReturnedError      = errors.New("server returned error")
 	ErrInvalidInlineBotID       = errors.New("invalid inline bot ID")
+	// ErrUnsupportedReplyType is returned by Client.BuildReply when the reply content has no field that accepts a ContextInfo (e.g. reactions, protocol messages).
+	ErrUnsupportedReplyType = errors.New("reply content type has no ContextInfo field")
 )
 
 type DownloadHTTPError struct {
@@ -150,6 +152,7 @@ var (
 	ErrNotEncryptedCommentMessage    = errors.New("given message isn't an encrypted comment message")
 	ErrNotSecretEncryptedMessage     = errors.New("given message isn't a secret encrypted message")
 	ErrNotPollUpdateMessage          = errors.New("given message isn't a poll update message")
+	ErrNotEventResponseMessage       = errors.New("given message isn't an event response message")
 )
 
 type wrappedIQError struct {

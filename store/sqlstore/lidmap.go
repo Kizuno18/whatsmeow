@@ -45,8 +45,9 @@ func NewCachedLIDMap(db *dbutil.Database) *CachedLIDMap {
 }
 
 const (
-	deleteExistingLIDMappingQuery = `DELETE FROM whatsmeow_lid_map WHERE (lid<>$1 AND pn=$2)`
-	putLIDMappingQuery            = `
+	deleteExistingLIDMappingQuery  = `DELETE FROM whatsmeow_lid_map WHERE (lid<>$1 AND pn=$2)`
+	deleteExistingLIDMappingsQuery = `DELETE FROM whatsmeow_lid_map WHERE pn IN (%s) OR lid IN (%s)`
+	putLIDMappingQuery             = `
 		INSERT INTO whatsmeow_lid_map (lid, pn)
 		VALUES ($1, $2)
 		ON CONFLICT (lid) DO UPDATE SET pn=excluded.pn WHERE whatsmeow_lid_map.pn<>excluded.pn
@@ -54,6 +55,12 @@ const (
 	getLIDForPNQuery       = `SELECT lid FROM whatsmeow_lid_map WHERE pn=$1`
 	getPNForLIDQuery       = `SELECT pn FROM whatsmeow_lid_map WHERE lid=$1`
 	getAllLIDMappingsQuery = `SELECT lid, pn FROM whatsmeow_lid_map`
+)
+
+const lidMappingBatchSize = 400
+
+var putLIDMappingsMassInsertBuilder = dbutil.NewMassInsertBuilder[store.LIDMapping, [0]any](
+	putLIDMappingQuery, "($%d, $%d)",
 )
 
 var convertLIDRow = dbutil.ConvertRowFn[store.LIDMapping](func(rows dbutil.Scannable) (store.LIDMapping, error) {
@@ -194,6 +201,65 @@ func (s *CachedLIDMap) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (
 	return result, err
 }
 
+func (s *CachedLIDMap) GetManyPNsForLIDs(ctx context.Context, lids []types.JID) (map[types.JID]types.JID, error) {
+	if len(lids) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[types.JID]types.JID, len(lids))
+
+	s.lidCacheLock.RLock()
+	missingLIDs := make([]string, 0, len(lids))
+	missingLIDDevices := make(map[string][]types.JID)
+	for _, lid := range lids {
+		if lid.Server != types.HiddenUserServer {
+			continue
+		}
+		if pnUser, ok := s.lidToPNCache[lid.User]; ok && pnUser != "" {
+			result[lid] = types.JID{User: pnUser, Device: lid.Device, Server: types.DefaultUserServer}
+		} else if !s.cacheFilled {
+			missingLIDs = append(missingLIDs, lid.User)
+			missingLIDDevices[lid.User] = append(missingLIDDevices[lid.User], lid)
+		}
+	}
+	s.lidCacheLock.RUnlock()
+
+	if len(missingLIDs) == 0 {
+		return result, nil
+	}
+
+	s.lidCacheLock.Lock()
+	defer s.lidCacheLock.Unlock()
+
+	var res dbutil.RowIter[store.LIDMapping]
+	if s.db.Dialect == dbutil.Postgres && PostgresArrayWrapper != nil {
+		res = convertLIDRow.NewRowIter(s.db.Query(
+			ctx,
+			`SELECT lid, pn FROM whatsmeow_lid_map WHERE lid = ANY($1)`,
+			PostgresArrayWrapper(missingLIDs),
+		))
+	} else {
+		placeholders := make([]string, len(missingLIDs))
+		for i := range missingLIDs {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		res = convertLIDRow.NewRowIter(s.db.Query(
+			ctx,
+			fmt.Sprintf(`SELECT lid, pn FROM whatsmeow_lid_map WHERE lid IN (%s)`, strings.Join(placeholders, ",")),
+			exslices.CastToAny(missingLIDs)...,
+		))
+	}
+	err := s.scanManyLids(res, func(lid, pn string) {
+		for _, dev := range missingLIDDevices[lid] {
+			pnDev := dev
+			pnDev.Server = types.DefaultUserServer
+			pnDev.User = pn
+			result[dev] = pnDev
+		}
+	})
+	return result, err
+}
+
 func (s *CachedLIDMap) PutLIDMapping(ctx context.Context, lid, pn types.JID) error {
 	if lid.Server != types.HiddenUserServer || pn.Server != types.DefaultUserServer {
 		return fmt.Errorf("invalid PutLIDMapping call %s/%s", lid, pn)
@@ -230,15 +296,78 @@ func (s *CachedLIDMap) PutManyLIDMappings(ctx context.Context, mappings []store.
 	if len(mappings) == 0 {
 		return nil
 	}
-	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
-		for _, mapping := range mappings {
-			err := s.unlockedPutLIDMapping(ctx, mapping.LID, mapping.PN)
+	inserts := dropSupersededLIDMappings(mappings)
+	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		for chunk := range slices.Chunk(mappings, lidMappingBatchSize) {
+			err := s.deleteExistingLIDMappings(ctx, chunk)
+			if err != nil {
+				return err
+			}
+		}
+		for chunk := range slices.Chunk(inserts, lidMappingBatchSize) {
+			query, vars := putLIDMappingsMassInsertBuilder.Build([0]any{}, chunk)
+			_, err := s.db.Exec(ctx, query, vars...)
 			if err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, mapping := range mappings {
+		s.unlockedUpdateLIDCache(mapping.LID.User, mapping.PN.User)
+	}
+	return nil
+}
+
+// dropSupersededLIDMappings drops entries that a later entry in the list overrides by reusing either
+// the LID or the PN. A single mass insert can't apply two rows that conflict on the primary key or on
+// the unique PN column, while the per-row path this replaces would simply have overwritten the older
+// entry, so the overridden entries have to be removed before building the insert query.
+func dropSupersededLIDMappings(mappings []store.LIDMapping) []store.LIDMapping {
+	latestByLID := make(map[string]int, len(mappings))
+	latestByPN := make(map[string]int, len(mappings))
+	superseded := make([]bool, len(mappings))
+	for i, mapping := range mappings {
+		if prev, ok := latestByLID[mapping.LID.User]; ok {
+			superseded[prev] = true
+			delete(latestByPN, mappings[prev].PN.User)
+		}
+		if prev, ok := latestByPN[mapping.PN.User]; ok {
+			superseded[prev] = true
+			delete(latestByLID, mappings[prev].LID.User)
+		}
+		latestByLID[mapping.LID.User] = i
+		latestByPN[mapping.PN.User] = i
+	}
+	inserts := make([]store.LIDMapping, 0, len(mappings))
+	for i, mapping := range mappings {
+		if !superseded[i] {
+			inserts = append(inserts, mapping)
+		}
+	}
+	return inserts
+}
+
+// deleteExistingLIDMappings removes every row holding one of the given LIDs or PNs. Clearing both
+// columns is what makes the mass insert that follows equivalent to upserting the mappings one by one:
+// it can't hit the unique constraint on the PN column, and mappings that only appear as the old half
+// of a reassignment are dropped instead of being left behind pointing at the wrong side.
+func (s *CachedLIDMap) deleteExistingLIDMappings(ctx context.Context, mappings []store.LIDMapping) error {
+	pnPlaceholders := make([]string, len(mappings))
+	lidPlaceholders := make([]string, len(mappings))
+	vars := make([]any, len(mappings)*2)
+	for i, mapping := range mappings {
+		pnPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		lidPlaceholders[i] = fmt.Sprintf("$%d", len(mappings)+i+1)
+		vars[i] = mapping.PN.User
+		vars[len(mappings)+i] = mapping.LID.User
+	}
+	query := fmt.Sprintf(deleteExistingLIDMappingsQuery, strings.Join(pnPlaceholders, ","), strings.Join(lidPlaceholders, ","))
+	_, err := s.db.Exec(ctx, query, vars...)
+	return err
 }
 
 func (s *CachedLIDMap) unlockedPutLIDMapping(ctx context.Context, lid, pn types.JID) error {
@@ -253,15 +382,19 @@ func (s *CachedLIDMap) unlockedPutLIDMapping(ctx context.Context, lid, pn types.
 	if err != nil {
 		return err
 	}
-	oldLID := s.pnToLIDCache[pn.User]
-	oldPN := s.lidToPNCache[lid.User]
-	s.pnToLIDCache[pn.User] = lid.User
-	s.lidToPNCache[lid.User] = pn.User
-	if oldPN != "" && oldPN != pn.User && s.pnToLIDCache[oldPN] == lid.User {
+	s.unlockedUpdateLIDCache(lid.User, pn.User)
+	return nil
+}
+
+func (s *CachedLIDMap) unlockedUpdateLIDCache(lid, pn string) {
+	oldLID := s.pnToLIDCache[pn]
+	oldPN := s.lidToPNCache[lid]
+	s.pnToLIDCache[pn] = lid
+	s.lidToPNCache[lid] = pn
+	if oldPN != "" && oldPN != pn && s.pnToLIDCache[oldPN] == lid {
 		delete(s.pnToLIDCache, oldPN)
 	}
-	if oldLID != "" && oldLID != lid.User && s.lidToPNCache[oldLID] == pn.User {
+	if oldLID != "" && oldLID != lid && s.lidToPNCache[oldLID] == pn {
 		delete(s.lidToPNCache, oldLID)
 	}
-	return nil
 }
