@@ -129,9 +129,11 @@ type SendResponse struct {
 
 	// Whether the server responded with a different participant list hash than the one used to
 	// encrypt the message, meaning the local device list cache was stale and some of the
-	// recipient's devices likely did not receive the message. The stale cache entry is
-	// invalidated automatically, so resending the message (e.g. with the same ID via
-	// SendRequestExtra) will fetch a fresh device list and re-encrypt for the correct sessions.
+	// recipient's devices likely did not receive the message. For group and direct chats the
+	// stale cache entry is invalidated automatically, so resending the message (e.g. with the
+	// same ID via SendRequestExtra) will fetch a fresh device list and re-encrypt for the
+	// correct sessions. Broadcast list caches are not invalidated yet, so a resend to a
+	// broadcast list will reuse the same stale participant list.
 	PHashMismatch bool
 }
 
