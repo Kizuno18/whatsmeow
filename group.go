@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store"
@@ -818,12 +819,12 @@ func parseGroupLinkTargetNode(groupNode *waBinary.Node) (types.GroupLinkTarget, 
 	}, ag.Error()
 }
 
-func parseParticipantList(node *waBinary.Node) (participants []types.JID, lidPairs []store.LIDMapping) {
+func parseParticipantList(node *waBinary.Node, extraTags ...string) (participants []types.JID, lidPairs []store.LIDMapping) {
 	children := node.GetChildren()
 	participants = make([]types.JID, 0, len(children))
 	for _, child := range children {
 		jid, ok := child.Attrs["jid"].(types.JID)
-		if child.Tag != "participant" || !ok {
+		if !ok || (child.Tag != "participant" && !slices.Contains(extraTags, child.Tag)) {
 			continue
 		}
 		participants = append(participants, jid)
@@ -844,6 +845,22 @@ func parseParticipantList(node *waBinary.Node) (participants []types.JID, lidPai
 				})
 			}
 		}
+	}
+	return
+}
+
+// membershipRequestFallback returns the notification sender as the single membership requester.
+// Membership request notifications about a single user don't always repeat that user in a child
+// node, they only have it in the notification's own participant attribute. The sender is only the
+// requester for self-made requests: with request_method=non_admin_add the sender is the member who
+// added someone else.
+func membershipRequestFallback(sender, senderPN *types.JID, requestMethod string) (participants []types.JID, lidPairs []store.LIDMapping) {
+	if sender == nil || sender.IsEmpty() || (requestMethod != "" && requestMethod != "invite_link") {
+		return
+	}
+	participants = []types.JID{*sender}
+	if sender.Server == types.HiddenUserServer && senderPN != nil && !senderPN.IsEmpty() {
+		lidPairs = []store.LIDMapping{{LID: *sender, PN: *senderPN}}
 	}
 	return
 }
@@ -994,6 +1011,24 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 			evt.Suspended = true
 		case "unsuspended":
 			evt.Unsuspended = true
+		case "created_membership_requests":
+			method := cag.OptionalString("request_method")
+			if method != "" {
+				evt.MembershipRequestMethod = method
+			}
+			requesters, requestPairs := parseParticipantList(&child, "membership_approval_request")
+			if len(requesters) == 0 {
+				requesters, requestPairs = membershipRequestFallback(evt.Sender, evt.SenderPN, method)
+			}
+			evt.MembershipRequestsCreated = append(evt.MembershipRequestsCreated, requesters...)
+			lidPairs = append(lidPairs, requestPairs...)
+		case "deleted_membership_requests", "revoked_membership_requests":
+			requesters, requestPairs := parseParticipantList(&child, "membership_approval_request")
+			if len(requesters) == 0 {
+				requesters, requestPairs = membershipRequestFallback(evt.Sender, evt.SenderPN, cag.OptionalString("request_method"))
+			}
+			evt.MembershipRequestsRevoked = append(evt.MembershipRequestsRevoked, requesters...)
+			lidPairs = append(lidPairs, requestPairs...)
 		default:
 			evt.UnknownChanges = append(evt.UnknownChanges, &child)
 		}
