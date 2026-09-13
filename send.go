@@ -28,6 +28,7 @@ import (
 	"go.mau.fi/libsignal/signalerror"
 	"go.mau.fi/util/random"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAICommon"
@@ -613,6 +614,231 @@ func (cli *Client) BuildEdit(chat types.JID, id types.MessageID, newContent *waE
 			},
 		},
 	}
+}
+
+// BuildReply wraps replyContent so that it quotes the message identified by quotedInfo and quotedMsg.
+// The built message can be sent normally using Client.SendMessage.
+//
+// quotedMsg is embedded as a stripped copy (principal content only, no nested quote chain), matching
+// what official WhatsApp clients do. Plain Conversation reply content is promoted to ExtendedTextMessage,
+// and any ContextInfo already set on replyContent (mentions, forwarding flags) is preserved, except for
+// the quote fields themselves, which always point at quotedInfo/quotedMsg.
+//
+// The returned message is a copy: neither quotedMsg nor replyContent is modified.
+//
+// Returns ErrUnsupportedReplyType if replyContent has no field that accepts a ContextInfo.
+//
+//	reply, err := cli.BuildReply(&evt.Info, evt.Message, &waE2E.Message{
+//		Conversation: proto.String("answering"),
+//	})
+func (cli *Client) BuildReply(quotedInfo *types.MessageInfo, quotedMsg, replyContent *waE2E.Message) (*waE2E.Message, error) {
+	if quotedInfo == nil || quotedMsg == nil || replyContent == nil {
+		return nil, errors.New("BuildReply: quotedInfo, quotedMsg and replyContent must all be non-nil")
+	}
+	reply := proto.Clone(replyContent).(*waE2E.Message)
+	if reply.Conversation != nil && reply.ExtendedTextMessage == nil {
+		text := reply.GetConversation()
+		reply.Conversation = nil
+		reply.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: proto.String(text)}
+	}
+	ci := &waE2E.ContextInfo{
+		StanzaID:      proto.String(quotedInfo.ID),
+		Participant:   proto.String(cli.replyParticipant(quotedInfo).String()),
+		QuotedMessage: stripQuotedMessage(quotedMsg),
+	}
+	if err := attachQuotedContext(reply, ci); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
+func (cli *Client) replyParticipant(info *types.MessageInfo) types.JID {
+	if info.IsFromMe {
+		if info.Sender.Server == types.HiddenUserServer {
+			return cli.getOwnLID().ToNonAD()
+		}
+		return cli.getOwnID().ToNonAD()
+	}
+	return info.Sender.ToNonAD()
+}
+
+func stripQuotedMessage(msg *waE2E.Message) *waE2E.Message {
+	switch {
+	case msg.Conversation != nil:
+		return &waE2E.Message{Conversation: proto.String(msg.GetConversation())}
+	case msg.ExtendedTextMessage != nil:
+		et := clearNestedQuote(proto.Clone(msg.ExtendedTextMessage).(*waE2E.ExtendedTextMessage))
+		if extendedTextOnlyHasText(et) {
+			return &waE2E.Message{Conversation: proto.String(et.GetText())}
+		}
+		return &waE2E.Message{ExtendedTextMessage: et}
+	case msg.ImageMessage != nil:
+		return &waE2E.Message{ImageMessage: clearNestedQuote(proto.Clone(msg.ImageMessage).(*waE2E.ImageMessage))}
+	case msg.VideoMessage != nil:
+		return &waE2E.Message{VideoMessage: clearNestedQuote(proto.Clone(msg.VideoMessage).(*waE2E.VideoMessage))}
+	case msg.AudioMessage != nil:
+		return &waE2E.Message{AudioMessage: clearNestedQuote(proto.Clone(msg.AudioMessage).(*waE2E.AudioMessage))}
+	case msg.DocumentMessage != nil:
+		return &waE2E.Message{DocumentMessage: clearNestedQuote(proto.Clone(msg.DocumentMessage).(*waE2E.DocumentMessage))}
+	case msg.StickerMessage != nil:
+		return &waE2E.Message{StickerMessage: clearNestedQuote(proto.Clone(msg.StickerMessage).(*waE2E.StickerMessage))}
+	case msg.LocationMessage != nil:
+		return &waE2E.Message{LocationMessage: clearNestedQuote(proto.Clone(msg.LocationMessage).(*waE2E.LocationMessage))}
+	case msg.LiveLocationMessage != nil:
+		return &waE2E.Message{LiveLocationMessage: clearNestedQuote(proto.Clone(msg.LiveLocationMessage).(*waE2E.LiveLocationMessage))}
+	case msg.ContactMessage != nil:
+		return &waE2E.Message{ContactMessage: clearNestedQuote(proto.Clone(msg.ContactMessage).(*waE2E.ContactMessage))}
+	case msg.ContactsArrayMessage != nil:
+		return &waE2E.Message{ContactsArrayMessage: clearNestedQuote(proto.Clone(msg.ContactsArrayMessage).(*waE2E.ContactsArrayMessage))}
+	case msg.PollCreationMessage != nil:
+		return &waE2E.Message{PollCreationMessage: clearNestedQuote(proto.Clone(msg.PollCreationMessage).(*waE2E.PollCreationMessage))}
+	case msg.ButtonsMessage != nil:
+		return &waE2E.Message{ButtonsMessage: clearNestedQuote(proto.Clone(msg.ButtonsMessage).(*waE2E.ButtonsMessage))}
+	case msg.ListMessage != nil:
+		return &waE2E.Message{ListMessage: clearNestedQuote(proto.Clone(msg.ListMessage).(*waE2E.ListMessage))}
+	case msg.InteractiveMessage != nil:
+		return &waE2E.Message{InteractiveMessage: clearNestedQuote(proto.Clone(msg.InteractiveMessage).(*waE2E.InteractiveMessage))}
+	case msg.GroupInviteMessage != nil:
+		return &waE2E.Message{GroupInviteMessage: clearNestedQuote(proto.Clone(msg.GroupInviteMessage).(*waE2E.GroupInviteMessage))}
+	case msg.ProductMessage != nil:
+		return &waE2E.Message{ProductMessage: clearNestedQuote(proto.Clone(msg.ProductMessage).(*waE2E.ProductMessage))}
+	default:
+		return stripUnknownQuotedMessage(msg)
+	}
+}
+
+func stripUnknownQuotedMessage(msg *waE2E.Message) *waE2E.Message {
+	stripped := proto.Clone(msg).(*waE2E.Message)
+	stripQuoteChain(stripped.ProtoReflect())
+	return stripped
+}
+
+func stripQuoteChain(msg protoreflect.Message) {
+	if !msg.IsValid() {
+		return
+	}
+	switch typed := msg.Interface().(type) {
+	case *waE2E.Message:
+		typed.MessageContextInfo = nil
+	case *waE2E.ContextInfo:
+		typed.QuotedMessage = nil
+	}
+	msg.Range(func(fd protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		if fd.Kind() != protoreflect.MessageKind {
+			return true
+		}
+		switch {
+		case fd.IsList():
+			list := value.List()
+			for i := range list.Len() {
+				stripQuoteChain(list.Get(i).Message())
+			}
+		case fd.IsMap():
+			if fd.MapValue().Kind() != protoreflect.MessageKind {
+				return true
+			}
+			value.Map().Range(func(_ protoreflect.MapKey, value protoreflect.Value) bool {
+				stripQuoteChain(value.Message())
+				return true
+			})
+		default:
+			stripQuoteChain(value.Message())
+		}
+		return true
+	})
+}
+
+func clearNestedQuote[T interface{ GetContextInfo() *waE2E.ContextInfo }](sub T) T {
+	if ci := sub.GetContextInfo(); ci != nil {
+		ci.QuotedMessage = nil
+	}
+	return sub
+}
+
+func extendedTextOnlyHasText(et *waE2E.ExtendedTextMessage) bool {
+	if et == nil || et.Text == nil {
+		return false
+	}
+	cp := proto.Clone(et).(*waE2E.ExtendedTextMessage)
+	cp.Text = nil
+	cp.ContextInfo = nil
+	return proto.Equal(cp, &waE2E.ExtendedTextMessage{})
+}
+
+func attachQuotedContext(msg *waE2E.Message, ci *waE2E.ContextInfo) error {
+	switch {
+	case msg.ViewOnceMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessage.Message, ci)
+	case msg.ViewOnceMessageV2.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessageV2.Message, ci)
+	case msg.ViewOnceMessageV2Extension.GetMessage() != nil:
+		return attachQuotedContext(msg.ViewOnceMessageV2Extension.Message, ci)
+	case msg.LottieStickerMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.LottieStickerMessage.Message, ci)
+	case msg.EphemeralMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.EphemeralMessage.Message, ci)
+	case msg.DocumentWithCaptionMessage.GetMessage() != nil:
+		return attachQuotedContext(msg.DocumentWithCaptionMessage.Message, ci)
+	case msg.ExtendedTextMessage != nil:
+		msg.ExtendedTextMessage.ContextInfo = mergeQuotedCtx(msg.ExtendedTextMessage.ContextInfo, ci)
+	case msg.ImageMessage != nil:
+		msg.ImageMessage.ContextInfo = mergeQuotedCtx(msg.ImageMessage.ContextInfo, ci)
+	case msg.VideoMessage != nil:
+		msg.VideoMessage.ContextInfo = mergeQuotedCtx(msg.VideoMessage.ContextInfo, ci)
+	case msg.PtvMessage != nil:
+		msg.PtvMessage.ContextInfo = mergeQuotedCtx(msg.PtvMessage.ContextInfo, ci)
+	case msg.AudioMessage != nil:
+		msg.AudioMessage.ContextInfo = mergeQuotedCtx(msg.AudioMessage.ContextInfo, ci)
+	case msg.DocumentMessage != nil:
+		msg.DocumentMessage.ContextInfo = mergeQuotedCtx(msg.DocumentMessage.ContextInfo, ci)
+	case msg.StickerMessage != nil:
+		msg.StickerMessage.ContextInfo = mergeQuotedCtx(msg.StickerMessage.ContextInfo, ci)
+	case msg.LocationMessage != nil:
+		msg.LocationMessage.ContextInfo = mergeQuotedCtx(msg.LocationMessage.ContextInfo, ci)
+	case msg.LiveLocationMessage != nil:
+		msg.LiveLocationMessage.ContextInfo = mergeQuotedCtx(msg.LiveLocationMessage.ContextInfo, ci)
+	case msg.ContactMessage != nil:
+		msg.ContactMessage.ContextInfo = mergeQuotedCtx(msg.ContactMessage.ContextInfo, ci)
+	case msg.ContactsArrayMessage != nil:
+		msg.ContactsArrayMessage.ContextInfo = mergeQuotedCtx(msg.ContactsArrayMessage.ContextInfo, ci)
+	case msg.PollCreationMessage != nil:
+		msg.PollCreationMessage.ContextInfo = mergeQuotedCtx(msg.PollCreationMessage.ContextInfo, ci)
+	case msg.PollCreationMessageV2 != nil:
+		msg.PollCreationMessageV2.ContextInfo = mergeQuotedCtx(msg.PollCreationMessageV2.ContextInfo, ci)
+	case msg.PollCreationMessageV3 != nil:
+		msg.PollCreationMessageV3.ContextInfo = mergeQuotedCtx(msg.PollCreationMessageV3.ContextInfo, ci)
+	case msg.EventMessage != nil:
+		msg.EventMessage.ContextInfo = mergeQuotedCtx(msg.EventMessage.ContextInfo, ci)
+	case msg.ButtonsMessage != nil:
+		msg.ButtonsMessage.ContextInfo = mergeQuotedCtx(msg.ButtonsMessage.ContextInfo, ci)
+	case msg.ListMessage != nil:
+		msg.ListMessage.ContextInfo = mergeQuotedCtx(msg.ListMessage.ContextInfo, ci)
+	case msg.InteractiveMessage != nil:
+		msg.InteractiveMessage.ContextInfo = mergeQuotedCtx(msg.InteractiveMessage.ContextInfo, ci)
+	case msg.GroupInviteMessage != nil:
+		msg.GroupInviteMessage.ContextInfo = mergeQuotedCtx(msg.GroupInviteMessage.ContextInfo, ci)
+	case msg.ProductMessage != nil:
+		msg.ProductMessage.ContextInfo = mergeQuotedCtx(msg.ProductMessage.ContextInfo, ci)
+	default:
+		return ErrUnsupportedReplyType
+	}
+	return nil
+}
+
+// mergeQuotedCtx keeps the unrelated parts of an existing ContextInfo (mentions, forwarding flags,
+// disappearing message settings, ...) but always replaces the quote itself, so building a reply out of
+// content that already quoted something points the new quote at the message actually being replied to.
+func mergeQuotedCtx(existing, incoming *waE2E.ContextInfo) *waE2E.ContextInfo {
+	if existing == nil {
+		return incoming
+	}
+	existing.StanzaID = incoming.StanzaID
+	existing.Participant = incoming.Participant
+	existing.QuotedMessage = incoming.QuotedMessage
+	if incoming.RemoteJID != nil {
+		existing.RemoteJID = incoming.RemoteJID
+	}
+	return existing
 }
 
 const (
