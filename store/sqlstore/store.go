@@ -272,6 +272,7 @@ func (s *SQLStore) MigratePNToLID(ctx context.Context, pn, lid types.JID) error 
 		s.log.Warnf("Failed to check for rows to migrate from %s: %v", pnSignal, err)
 	} else if !hasPNRows {
 		s.log.Debugf("Nothing to migrate from %s to %s", pnSignal, lidSignal)
+		s.migratedPNSessionsCache.Remove(pnSignal)
 		return nil
 	}
 	var sessionsUpdated, identityKeysUpdated, senderKeysUpdated int64
