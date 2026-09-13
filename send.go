@@ -698,6 +698,26 @@ func (cli *Client) sendNewsletter(
 	mediaID string,
 	timings *MessageDebugTimings,
 ) ([]byte, error) {
+	node, err := prepareNewsletterMessageNode(to, id, message, mediaID, timings)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	data, err := cli.sendNodeAndGetData(ctx, node)
+	timings.Send = time.Since(start)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send message node: %w", err)
+	}
+	return data, nil
+}
+
+func prepareNewsletterMessageNode(
+	to types.JID,
+	id types.MessageID,
+	message *waE2E.Message,
+	mediaID string,
+	timings *MessageDebugTimings,
+) (waBinary.Node, error) {
 	attrs := waBinary.Attrs{
 		"to":   to,
 		"id":   id,
@@ -717,7 +737,7 @@ func (cli *Client) sendNewsletter(
 	plaintext, _, err := marshalMessage(to, message)
 	timings.Marshal = time.Since(start)
 	if err != nil {
-		return nil, err
+		return waBinary.Node{}, err
 	}
 	plaintextNode := waBinary.Node{
 		Tag:     "plaintext",
@@ -729,18 +749,15 @@ func (cli *Client) sendNewsletter(
 			plaintextNode.Attrs["mediatype"] = mediaType
 		}
 	}
-	node := waBinary.Node{
+	content := []waBinary.Node{plaintextNode}
+	if attrs["type"] == "event" {
+		content = append(content, eventCreationMetaNode())
+	}
+	return waBinary.Node{
 		Tag:     "message",
 		Attrs:   attrs,
-		Content: []waBinary.Node{plaintextNode},
-	}
-	start = time.Now()
-	data, err := cli.sendNodeAndGetData(ctx, node)
-	timings.Send = time.Since(start)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send message node: %w", err)
-	}
-	return data, nil
+		Content: content,
+	}, nil
 }
 
 type nodeExtraParams struct {
@@ -923,6 +940,8 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return "reaction"
 	case msg.PollCreationMessage != nil, msg.PollUpdateMessage != nil:
 		return "poll"
+	case msg.EventMessage != nil:
+		return "event"
 	case getMediaTypeFromMessage(msg) != "":
 		return "media"
 	case msg.Conversation != nil, msg.ExtendedTextMessage != nil, msg.ProtocolMessage != nil:
@@ -1137,6 +1156,10 @@ func (cli *Client) getMessageContent(
 			},
 		})
 	}
+	if msgAttrs["type"] == "event" {
+		// Edits and cancellations are wrapped in EditedMessage, so only creations reach here.
+		content = append(content, eventCreationMetaNode())
+	}
 
 	if extraParams.botNode != nil {
 		content = append(content, *extraParams.botNode)
@@ -1158,6 +1181,15 @@ func (cli *Client) getMessageContent(
 		})
 	}
 	return content
+}
+
+func eventCreationMetaNode() waBinary.Node {
+	return waBinary.Node{
+		Tag: "meta",
+		Attrs: waBinary.Attrs{
+			"event_type": "creation",
+		},
+	}
 }
 
 func (cli *Client) prepareMessageNode(
