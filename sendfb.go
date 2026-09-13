@@ -146,15 +146,17 @@ func (cli *Client) SendFBMessage(
 	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
+	var participants []types.JID
 	switch to.Server {
 	case types.GroupServer:
-		phash, data, err = cli.sendGroupV3(ctx, to, ownID, req.ID, messageApp, msgAttrs, frankingTag, &resp.DebugTimings)
+		phash, data, participants, err = cli.sendGroupV3(ctx, to, ownID, req.ID, messageApp, msgAttrs, frankingTag, &resp.DebugTimings)
 	case types.DefaultUserServer, types.MessengerServer:
 		if req.Peer {
 			err = fmt.Errorf("peer messages to fb are not yet supported")
 			//data, err = cli.sendPeerMessage(to, req.ID, message, &resp.DebugTimings)
 		} else {
 			data, phash, err = cli.sendDMV3(ctx, to, ownID, req.ID, messageApp, msgAttrs, frankingTag, &resp.DebugTimings)
+			participants = []types.JID{to.ToNonAD(), ownID.ToNonAD()}
 		}
 	default:
 		err = fmt.Errorf("%w %s", ErrUnknownServer, to.Server)
@@ -199,13 +201,23 @@ func (cli *Client) SendFBMessage(
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
+		resp.PHashMismatch = true
 		cli.Log.Warnf("Server returned different participant list hash when sending to %s. Some devices may not have received the message.", to)
-		// TODO also invalidate device list caches
-		cli.groupCacheLock.Lock()
-		delete(cli.groupCache, to)
-		cli.groupCacheLock.Unlock()
+		cli.handleFBPHashMismatch(to, participants)
 	}
 	return
+}
+
+func (cli *Client) handleFBPHashMismatch(to types.JID, participants []types.JID) {
+	cli.groupCacheLock.Lock()
+	delete(cli.groupCache, to)
+	cli.groupCacheLock.Unlock()
+
+	cli.userDevicesCacheLock.Lock()
+	for _, participant := range participants {
+		delete(cli.userDevicesCache, participant.ToNonAD())
+	}
+	cli.userDevicesCacheLock.Unlock()
 }
 
 func (cli *Client) sendGroupV3(
@@ -217,14 +229,14 @@ func (cli *Client) sendGroupV3(
 	msgAttrs messageAttrs,
 	frankingTag []byte,
 	timings *MessageDebugTimings,
-) (string, []byte, error) {
+) (string, []byte, []types.JID, error) {
 	var groupMeta *groupMetaCache
 	var err error
 	start := time.Now()
 	if to.Server == types.GroupServer {
 		groupMeta, err = cli.getCachedGroupData(ctx, to)
 		if err != nil {
-			return "", nil, fmt.Errorf("failed to get group members: %w", err)
+			return "", nil, nil, fmt.Errorf("failed to get group members: %w", err)
 		}
 	}
 	timings.GetParticipants = time.Since(start)
@@ -234,7 +246,7 @@ func (cli *Client) sendGroupV3(
 	senderKeyName := protocol.NewSenderKeyName(to.String(), ownID.SignalAddress())
 	signalSKDMessage, err := builder.Create(ctx, senderKeyName)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to create sender key distribution message to send %s to %s: %w", id, to, err)
+		return "", nil, nil, fmt.Errorf("failed to create sender key distribution message to send %s to %s: %w", id, to, err)
 	}
 	skdm := &waMsgTransport.MessageTransport_Protocol_Ancillary_SenderKeyDistributionMessage{
 		GroupID:                             proto.String(to.String()),
@@ -267,11 +279,11 @@ func (cli *Client) sendGroupV3(
 		},
 	})
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to marshal message transport: %w", err)
+		return "", nil, nil, fmt.Errorf("failed to marshal message transport: %w", err)
 	}
 	encrypted, err := cipher.Encrypt(ctx, plaintext)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to encrypt group message to send %s to %s: %w", id, to, err)
+		return "", nil, nil, fmt.Errorf("failed to encrypt group message to send %s to %s: %w", id, to, err)
 	}
 	ciphertext := encrypted.SignedSerialize()
 	timings.GroupEncrypt = time.Since(start)
@@ -280,7 +292,7 @@ func (cli *Client) sendGroupV3(
 		ctx, to, ownID, id, nil, skdm, msgAttrs, frankingTag, groupMeta.Members, timings,
 	)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 
 	phash := participantListHashV2(allDevices)
@@ -299,9 +311,9 @@ func (cli *Client) sendGroupV3(
 	data, err := cli.sendNodeAndGetData(ctx, *node)
 	timings.Send = time.Since(start)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to send message node: %w", err)
+		return "", nil, nil, fmt.Errorf("failed to send message node: %w", err)
 	}
-	return phash, data, nil
+	return phash, data, groupMeta.Members, nil
 }
 
 func (cli *Client) sendDMV3(

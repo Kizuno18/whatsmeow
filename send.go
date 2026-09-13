@@ -126,6 +126,15 @@ type SendResponse struct {
 	// The identity the message was sent with (LID or PN)
 	// This is currently not reliable in all cases.
 	Sender types.JID
+
+	// Whether the server responded with a different participant list hash than the one used to
+	// encrypt the message, meaning the local device list cache was stale and some of the
+	// recipient's devices likely did not receive the message. For group and direct chats the
+	// stale cache entry is invalidated automatically, so resending the message (e.g. with the
+	// same ID via SendRequestExtra) will fetch a fresh device list and re-encrypt for the
+	// correct sessions. Broadcast list caches are not invalidated yet, so a resend to a
+	// broadcast list will reuse the same stale participant list.
+	PHashMismatch bool
 }
 
 // SendRequestExtra contains the optional parameters for SendMessage.
@@ -453,6 +462,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
+		resp.PHashMismatch = true
 		cli.Log.Warnf("Server returned different participant list hash (%s != %s) when sending to %s. Some devices may not have received the message.", phash, expectedPHash, to)
 		switch to.Server {
 		case types.GroupServer:
