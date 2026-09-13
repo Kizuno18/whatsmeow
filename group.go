@@ -368,7 +368,7 @@ func (cli *Client) SetGroupTopic(ctx context.Context, jid types.JID, previousID,
 	if previousID == "" {
 		oldInfo, err := cli.GetGroupInfo(ctx, jid)
 		if err != nil {
-			return fmt.Errorf("failed to get old group info to update topic: %v", err)
+			return fmt.Errorf("failed to get old group info to update topic: %w", err)
 		}
 		previousID = oldInfo.TopicID
 	}
@@ -1086,17 +1086,9 @@ func (cli *Client) SetGroupMemberAddMode(ctx context.Context, jid types.JID, mod
 }
 
 // SetGroupDescription updates the group description.
+//
+// Deprecated: use Client.SetGroupTopic instead, which allows specifying the previous and new
+// description IDs. This method is equivalent to calling it with both IDs left empty.
 func (cli *Client) SetGroupDescription(ctx context.Context, jid types.JID, description string) error {
-	content := waBinary.Node{
-		Tag: "description",
-		Content: []waBinary.Node{
-			{
-				Tag:     "body",
-				Content: []byte(description),
-			},
-		},
-	}
-
-	_, err := cli.sendGroupIQ(ctx, iqSet, jid, content)
-	return err
+	return cli.SetGroupTopic(ctx, jid, "", "", description)
 }
