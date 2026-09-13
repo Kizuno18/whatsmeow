@@ -707,30 +707,42 @@ func stripQuotedMessage(msg *waE2E.Message) *waE2E.Message {
 	}
 }
 
-// stripUnknownQuotedMessage gives message types that stripQuotedMessage doesn't know about the same
-// treatment as the enumerated ones: the top-level MessageContextInfo (which carries the original
-// message secret) is dropped and the nested quote of whichever submessage holds a ContextInfo is cleared.
-// FutureProofMessage wrappers (view once, ephemeral, document with caption, ...) are unwrapped, so the
-// message they carry is stripped too.
 func stripUnknownQuotedMessage(msg *waE2E.Message) *waE2E.Message {
 	stripped := proto.Clone(msg).(*waE2E.Message)
-	stripQuoteChain(stripped)
+	stripQuoteChain(stripped.ProtoReflect())
 	return stripped
 }
 
-func stripQuoteChain(msg *waE2E.Message) {
-	msg.MessageContextInfo = nil
-	msg.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
-		if fd.Kind() != protoreflect.MessageKind || fd.IsList() || fd.IsMap() {
+func stripQuoteChain(msg protoreflect.Message) {
+	if !msg.IsValid() {
+		return
+	}
+	switch typed := msg.Interface().(type) {
+	case *waE2E.Message:
+		typed.MessageContextInfo = nil
+	case *waE2E.ContextInfo:
+		typed.QuotedMessage = nil
+	}
+	msg.Range(func(fd protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		if fd.Kind() != protoreflect.MessageKind {
 			return true
 		}
-		switch sub := val.Message().Interface().(type) {
-		case *waE2E.FutureProofMessage:
-			if sub.Message != nil {
-				stripQuoteChain(sub.Message)
+		switch {
+		case fd.IsList():
+			list := value.List()
+			for i := range list.Len() {
+				stripQuoteChain(list.Get(i).Message())
 			}
-		case interface{ GetContextInfo() *waE2E.ContextInfo }:
-			clearNestedQuote(sub)
+		case fd.IsMap():
+			if fd.MapValue().Kind() != protoreflect.MessageKind {
+				return true
+			}
+			value.Map().Range(func(_ protoreflect.MapKey, value protoreflect.Value) bool {
+				stripQuoteChain(value.Message())
+				return true
+			})
+		default:
+			stripQuoteChain(value.Message())
 		}
 		return true
 	})

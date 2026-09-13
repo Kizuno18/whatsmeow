@@ -165,6 +165,78 @@ func TestStripQuotedMessageWrappedType(t *testing.T) {
 	}
 }
 
+func TestStripQuotedMessageContainerType(t *testing.T) {
+	original := &waE2E.Message{
+		CommentMessage: &waE2E.CommentMessage{
+			Message: &waE2E.Message{
+				DeviceSentMessage: &waE2E.DeviceSentMessage{
+					DestinationJID: proto.String("12345@s.whatsapp.net"),
+					Message: &waE2E.Message{
+						ImageMessage: &waE2E.ImageMessage{
+							Caption: proto.String("hi"),
+							ContextInfo: &waE2E.ContextInfo{
+								StanzaID:      proto.String("OLDER"),
+								QuotedMessage: nestedQuote(),
+							},
+							Annotations: []*waE2E.InteractiveAnnotation{{
+								EmbeddedContent: &waE2E.EmbeddedContent{
+									Content: &waE2E.EmbeddedContent_EmbeddedMessage{
+										EmbeddedMessage: &waE2E.EmbeddedMessage{
+											StanzaID: proto.String("EMBEDDED"),
+											Message: &waE2E.Message{
+												ImageMessage: &waE2E.ImageMessage{
+													Caption: proto.String("embedded"),
+													ContextInfo: &waE2E.ContextInfo{
+														StanzaID:      proto.String("DEEPLY NESTED"),
+														QuotedMessage: nestedQuote(),
+													},
+												},
+												MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte("embedded secret")},
+											},
+										},
+									},
+								},
+							}},
+						},
+						MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte("device message secret")},
+					},
+				},
+				MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte("inner secret")},
+			},
+		},
+		MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte("secret")},
+	}
+	stripped := stripQuotedMessage(original)
+	commentMessage := stripped.GetCommentMessage().GetMessage()
+	deviceSent := commentMessage.GetDeviceSentMessage()
+	deviceMessage := deviceSent.GetMessage()
+	embedded := deviceMessage.GetImageMessage().GetAnnotations()[0].GetEmbeddedContent().GetEmbeddedMessage()
+	embeddedMessage := embedded.GetMessage()
+	if stripped.MessageContextInfo != nil {
+		t.Error("stripped message still has MessageContextInfo")
+	}
+	if commentMessage.MessageContextInfo != nil || deviceMessage.MessageContextInfo != nil || embeddedMessage.MessageContextInfo != nil {
+		t.Error("contained message still has MessageContextInfo")
+	}
+	if deviceMessage.GetImageMessage().GetContextInfo().GetQuotedMessage() != nil ||
+		embeddedMessage.GetImageMessage().GetContextInfo().GetQuotedMessage() != nil {
+		t.Error("contained message still has a nested quote")
+	}
+	if deviceSent.GetDestinationJID() != "12345@s.whatsapp.net" || deviceMessage.GetImageMessage().GetCaption() != "hi" ||
+		deviceMessage.GetImageMessage().GetContextInfo().GetStanzaID() != "OLDER" || embedded.GetStanzaID() != "EMBEDDED" ||
+		embeddedMessage.GetImageMessage().GetCaption() != "embedded" || embeddedMessage.GetImageMessage().GetContextInfo().GetStanzaID() != "DEEPLY NESTED" {
+		t.Error("contained message lost non-quote fields")
+	}
+	originalComment := original.GetCommentMessage().GetMessage()
+	originalDeviceMessage := originalComment.GetDeviceSentMessage().GetMessage()
+	originalEmbeddedMessage := originalDeviceMessage.GetImageMessage().GetAnnotations()[0].GetEmbeddedContent().GetEmbeddedMessage().GetMessage()
+	if original.MessageContextInfo == nil || originalComment.MessageContextInfo == nil || originalDeviceMessage.MessageContextInfo == nil ||
+		originalEmbeddedMessage.MessageContextInfo == nil || originalDeviceMessage.GetImageMessage().GetContextInfo().GetQuotedMessage() == nil ||
+		originalEmbeddedMessage.GetImageMessage().GetContextInfo().GetQuotedMessage() == nil {
+		t.Error("stripQuotedMessage mutated the input message")
+	}
+}
+
 func TestBuildReplyToEventMessage(t *testing.T) {
 	cli := &Client{Store: &store.Device{}}
 	reply, err := cli.BuildReply(
