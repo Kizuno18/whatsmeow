@@ -368,7 +368,7 @@ func (cli *Client) SetGroupTopic(ctx context.Context, jid types.JID, previousID,
 	if previousID == "" {
 		oldInfo, err := cli.GetGroupInfo(ctx, jid)
 		if err != nil {
-			return fmt.Errorf("failed to get old group info to update topic: %v", err)
+			return fmt.Errorf("failed to get old group info to update topic: %w", err)
 		}
 		previousID = oldInfo.TopicID
 	}
