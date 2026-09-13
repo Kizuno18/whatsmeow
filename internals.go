@@ -744,7 +744,8 @@ func (int *DangerousInternalClient) EncryptMessageForDevice(ctx context.Context,
 }
 
 func (int *DangerousInternalClient) SendGroupV3(ctx context.Context, to, ownID types.JID, id types.MessageID, messageApp []byte, msgAttrs messageAttrs, frankingTag []byte, timings *MessageDebugTimings) (string, []byte, error) {
-	return int.c.sendGroupV3(ctx, to, ownID, id, messageApp, msgAttrs, frankingTag, timings)
+	phash, data, _, err := int.c.sendGroupV3(ctx, to, ownID, id, messageApp, msgAttrs, frankingTag, timings)
+	return phash, data, err
 }
 
 func (int *DangerousInternalClient) SendDMV3(ctx context.Context, to, ownID types.JID, id types.MessageID, messageApp []byte, msgAttrs messageAttrs, frankingTag []byte, timings *MessageDebugTimings) ([]byte, string, error) {
