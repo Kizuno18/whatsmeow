@@ -294,7 +294,7 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, Removed: isContactRemove, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			if isContactRemove {
-				storeUpdateError = cli.Store.Contacts.DeleteContactName(ctx, jid)
+				storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, "", "")
 			} else {
 				storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
 			}
